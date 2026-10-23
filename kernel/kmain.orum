@@ -1,0 +1,1502 @@
+# menagerie v0.2 — keyboard, heap, shell. Written in Orum, freestanding.
+# Entry: fn kmain(mbi), called by the loader's trampoline in 64-bit mode.
+#
+# Low memory (see docs/boot-contract.md):
+#   0x5000 IDT (4K, kernel builds it) | 0x6000 ISR stubs (256 x 16B)
+#   0x7000 common ISR handler | 0x7100 font (54 8x16 glyphs, original)
+#   0x7460 glyph index (128B: ASCII -> glyph idx, 0xFF = none)
+#   0x74E0 fb_addr u64 | 0x74E8 fb_stride u32 | 0x74EC tick u64
+#   0x74F4 IDT descriptor (16B)
+#   0x7504 kb_head u64 | 0x750C kb_tail u64
+#   0x7514 cursor_x u64 | 0x751C cursor_y u64
+#   0x7524 shift_state u64 | 0x752C e0skip u64
+#   0x7534 keyboard ring buffer (256B) | 0x7634 line buffer (128B)
+#   0x76B4 scancode table (128B) | 0x7734 shifted table (128B)
+#   0x77B4+ NUL-terminated strings (addresses below)
+# Heap: 0x2000000-0x3000000, via __orum_heap_start/__orum_heap_end
+#   (relocations resolved by the build; see boot/mkcustom.py).
+#
+# String addresses (must match boot/mkcustom.py):
+#   menagerie 0x77B4 | tick 0x77BE | crlf 0x77C4 | prompt 0x77C7
+#   unknown 0x77CA | notimpl 0x77DC | heap-ok 0x77F2 | heap-fail 0x77FA
+#   kb-ready 0x7804 | help-hdr 0x7813 | help1 0x781D | help2 0x7838
+#   help3 0x7856 | help4 0x7872 | help5 0x788F | help-note 0x7894
+#   say 0x78B4 | help 0x78B8 | clear 0x78BD | restart 0x78C3 | off 0x78CB
+#   list 0x78CF | run 0x78D4 | where 0x78D8 | copy 0x78DE | move 0x78E3
+#   burn 0x78E8 | newdir 0x78ED | show 0x78F4 | page 0x78F9 | edit 0x78FE
+#   match 0x7903 | search 0x7909 | tasks 0x7910 | stop 0x7916
+#   space 0x791B | size 0x7921 | past 0x7926
+#   xhci-key 0x792B | xhci-ready 0x7936 | xhci-nodev 0x794B
+#   xhci-found 0x7961 | xh-hex 0x7978 | xhci-stage 0x797B
+#   0x7988 HID usage->ASCII (256B) | 0x7A88 shifted HID table (256B)
+# xHCI region 0x1100000 (identity-mapped; see xHCI section):
+#   +0x0000 DCBAA | +0x0040 input ctx | +0x0140 device ctx
+#   +0x0240 cmd ring | +0x0340 ERST | +0x0380 event ring
+#   +0x0580 EP0 ring | +0x0680 intr-in ring | +0x0780 control data
+#   +0x0880 HID report (cur 8 + prev 8) | +0x0890 driver state
+
+# ---------------- port I/O ----------------
+fn outb(port: u16, val: u8)
+asm
+in port = rdx
+in val = rax
+raw 0xEE
+end
+end
+
+fn inb(port: u16) -> u8
+mut v: u64 = 0
+asm
+in port = rdx
+raw 0xEC
+out v = rax
+end
+mut b: u8 = v & 0xFF
+return b
+end
+
+fn poke8(addr: u64, val: u8)
+mut p: raw *u8 = rawptr(addr)
+p[0] = val
+end
+
+fn poke32(addr: u64, val: u32)
+mut p: raw *u32 = rawptr(addr)
+p[0] = val
+end
+
+fn poke64(addr: u64, val: u64)
+mut p: raw *u64 = rawptr(addr)
+p[0] = val
+end
+
+fn peek64(addr: u64) -> u64
+mut p: raw *u64 = rawptr(addr)
+return p[0]
+end
+
+fn peek32(addr: u64) -> u32
+mut p: raw *u32 = rawptr(addr)
+return p[0]
+end
+
+# ---------------- serial (COM1) ----------------
+fn serial_putc(ch: u8)
+outb(0x3F8, ch)
+end
+
+fn serial_write(ptr: u64, n: u32)
+mut i: u32 = 0
+while i < n
+mut p: raw *u8 = rawptr(ptr + i)
+serial_putc(p[0])
+i = i + 1
+end
+end
+
+fn serial_u64(v: u64)
+mut div: u64 = 10000000000000000000
+mut started = 0
+mut tmp: u64 = v
+while div > 0
+mut d: u64 = tmp / div
+if d != 0
+started = 1
+end
+if started == 1
+serial_putc(d + 48)
+end
+tmp = tmp % div
+div = div / 10
+end
+if started == 0
+serial_putc(48)
+end
+end
+
+# ---------------- multiboot2 info parsing ----------------
+fn read_u16(mbi: raw *u8, off: int) -> u16
+mut b0: u16 = mbi[off]
+mut b1: u16 = mbi[off + 1]
+return b0 | (b1 << 8)
+end
+
+fn read_u32(mbi: raw *u8, off: int) -> u32
+mut b0: u32 = mbi[off]
+mut b1: u32 = mbi[off + 1]
+mut b2: u32 = mbi[off + 2]
+mut b3: u32 = mbi[off + 3]
+return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+end
+
+fn read_u64(mbi: raw *u8, off: int) -> u64
+mut b0: u64 = mbi[off]
+mut b1: u64 = mbi[off + 1]
+mut b2: u64 = mbi[off + 2]
+mut b3: u64 = mbi[off + 3]
+mut b4: u64 = mbi[off + 4]
+mut b5: u64 = mbi[off + 5]
+mut b6: u64 = mbi[off + 6]
+mut b7: u64 = mbi[off + 7]
+return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+end
+
+# ---------------- framebuffer console ----------------
+fn draw_glyph_at(ch: u8, x: u32, y: u32, color: u32)
+mut fb: raw *u32 = rawptr(peek64(0x74E0))
+mut stride: u32 = peek32(0x74E8)
+mut c: u8 = ch
+if c < 32
+c = 63
+end
+if c > 126
+c = 63
+end
+mut cu: u64 = c
+mut ip: raw *u8 = rawptr(0x7460 + cu)
+mut idx: u8 = ip[0]
+if idx == 0xFF
+idx = 0
+end
+mut iu: u64 = idx
+mut grow: u64 = 0x7100 + iu * 16
+mut row: u32 = 0
+while row < 16
+mut p: raw *u8 = rawptr(grow + row)
+mut bits: u8 = p[0]
+mut col: u32 = 0
+while col < 8
+if ((bits >> (7 - col)) & 1) == 1
+fb[(y * 16 + row) * stride + (x + col)] = color
+end
+col = col + 1
+end
+row = row + 1
+end
+end
+
+fn clear_cell(x: u32, y: u32)
+mut fb: raw *u32 = rawptr(peek64(0x74E0))
+mut stride: u32 = peek32(0x74E8)
+mut row: u32 = 0
+while row < 16
+mut col: u32 = 0
+while col < 8
+fb[(y * 16 + row) * stride + (x * 8 + col)] = 4128
+col = col + 1
+end
+row = row + 1
+end
+end
+
+fn con_scroll()
+mut fba: u64 = peek64(0x74E0)
+mut stride: u64 = peek32(0x74E8)
+mut dst: raw *u64 = rawptr(fba)
+mut src: raw *u64 = rawptr(fba + stride * 64)
+mut n: u64 = 47 * 16 * stride / 2
+mut i: u64 = 0
+while i < n
+dst[i] = src[i]
+i = i + 1
+end
+mut fb: raw *u32 = rawptr(fba)
+mut st32: u32 = peek32(0x74E8)
+mut y: u32 = 47 * 16
+while y < 48 * 16
+mut x: u32 = 0
+while x < 128 * 8
+fb[y * st32 + x] = 4128
+x = x + 1
+end
+y = y + 1
+end
+end
+
+fn con_newline()
+mut cy: u64 = peek64(0x751C)
+poke64(0x7514, 0)
+cy = cy + 1
+if cy >= 48
+con_scroll()
+cy = 47
+end
+poke64(0x751C, cy)
+end
+
+fn con_putc(ch: u8)
+if ch == 10
+serial_putc(13)
+serial_putc(10)
+con_newline()
+else
+serial_putc(ch)
+mut cx: u64 = peek64(0x7514)
+mut cy: u64 = peek64(0x751C)
+mut x32: u32 = cx
+mut y32: u32 = cy
+draw_glyph_at(ch, x32, y32, 16777215)
+cx = cx + 1
+if cx >= 128
+cx = 0
+cy = cy + 1
+end
+if cy >= 48
+con_scroll()
+cy = 47
+end
+poke64(0x7514, cx)
+poke64(0x751C, cy)
+end
+end
+
+fn con_write(ptr: u64)
+mut i: u64 = 0
+mut go: u64 = 1
+while go == 1
+mut p: raw *u8 = rawptr(ptr + i)
+mut ch: u8 = p[0]
+if ch == 0
+go = 0
+else
+con_putc(ch)
+i = i + 1
+end
+end
+end
+
+fn con_clear()
+mut fba: u64 = peek64(0x74E0)
+mut stride: u64 = peek32(0x74E8)
+mut fb: raw *u32 = rawptr(fba)
+mut n: u64 = stride * 768
+mut i: u64 = 0
+while i < n
+mut i32: u32 = i
+fb[i32] = 4128
+i = i + 1
+end
+poke64(0x7514, 0)
+poke64(0x751C, 0)
+end
+
+fn con_backspace()
+mut cx: u64 = peek64(0x7514)
+if cx > 0
+cx = cx - 1
+poke64(0x7514, cx)
+mut cy: u64 = peek64(0x751C)
+mut x32: u32 = cx
+mut y32: u32 = cy
+clear_cell(x32, y32)
+serial_putc(8)
+end
+end
+
+# ---------------- keyboard ----------------
+fn kb_push(ch: u8)
+mut head: u64 = peek64(0x7504)
+mut tail: u64 = peek64(0x750C)
+mut nxt: u64 = (head + 1) % 256
+if nxt != tail
+mut p: raw *u8 = rawptr(0x7534 + head)
+p[0] = ch
+poke64(0x7504, nxt)
+end
+end
+
+fn kb_irq()
+if xh_st(136) == 1
+return
+end
+mut sc: u8 = inb(0x60)
+if peek64(0x752C) == 1
+poke64(0x752C, 0)
+else
+if sc == 224
+poke64(0x752C, 1)
+else
+if sc == 42
+poke64(0x7524, 1)
+else
+if sc == 54
+poke64(0x7524, 1)
+else
+if sc == 170
+poke64(0x7524, 0)
+else
+if sc == 182
+poke64(0x7524, 0)
+else
+if sc < 128
+mut tbl: u64 = 0x76B4
+if peek64(0x7524) == 1
+tbl = 0x7734
+end
+mut scu: u64 = sc
+mut p: raw *u8 = rawptr(tbl + scu)
+mut ch: u8 = p[0]
+if ch != 0
+kb_push(ch)
+end
+end
+end
+end
+end
+end
+end
+end
+end
+
+fn kb_has() -> int
+if peek64(0x7504) != peek64(0x750C)
+return 1
+end
+return 0
+end
+
+fn kb_get() -> u8
+mut tail: u64 = peek64(0x750C)
+mut p: raw *u8 = rawptr(0x7534 + tail)
+mut ch: u8 = p[0]
+poke64(0x750C, (tail + 1) % 256)
+return ch
+end
+
+fn kb_drain()
+mut n: u64 = 0
+mut go: u64 = 1
+while go == 1
+if n > 32
+go = 0
+else
+if (inb(0x64) & 1) == 1
+mut drop: u8 = inb(0x60)
+n = n + 1
+else
+go = 0
+end
+end
+end
+end
+
+# ---------------- interrupts ----------------
+fn build_idt()
+mut v: u64 = 0
+while v < 256
+mut stub: u64 = 24576 + v * 16
+mut e: u64 = 20480 + v * 16
+poke8(e, stub & 0xFF)
+poke8(e + 1, (stub >> 8) & 0xFF)
+poke8(e + 2, 0x18)
+poke8(e + 3, 0)
+poke8(e + 4, 0)
+poke8(e + 5, 0x8E)
+poke8(e + 6, (stub >> 16) & 0xFF)
+poke8(e + 7, (stub >> 24) & 0xFF)
+poke8(e + 8, 0)
+poke8(e + 9, 0)
+poke8(e + 10, 0)
+poke8(e + 11, 0)
+poke8(e + 12, 0)
+poke8(e + 13, 0)
+poke8(e + 14, 0)
+poke8(e + 15, 0)
+v = v + 1
+end
+end
+
+fn load_idt()
+poke8(0x74F4, 0xFF)
+poke8(0x74F5, 0x0F)
+poke8(0x74F6, 0x00)
+poke8(0x74F7, 0x50)
+poke8(0x74F8, 0)
+poke8(0x74F9, 0)
+poke8(0x74FA, 0)
+poke8(0x74FB, 0)
+poke8(0x74FC, 0)
+poke8(0x74FD, 0)
+mut d: u64 = 0x74F4
+asm
+in d = rax
+raw 0x0F
+raw 0x01
+raw 0x18
+end
+end
+
+fn pic_remap()
+outb(0x20, 0x11)
+outb(0xA0, 0x11)
+outb(0x21, 0x20)
+outb(0xA1, 0x28)
+outb(0x21, 0x04)
+outb(0xA1, 0x02)
+outb(0x21, 0x01)
+outb(0xA1, 0x01)
+outb(0x21, 0x00)
+outb(0xA1, 0x00)
+end
+
+fn pit_init()
+outb(0x43, 0x36)
+outb(0x40, 0x9C)
+outb(0x40, 0x2E)
+end
+
+fn irq_enable()
+asm
+raw 0xFB
+end
+end
+
+# Called from the asm ISR stub with the vector number in rdi.
+# Runs at interrupt time: keep it small, no heap, EOI the PIC.
+fn on_irq(vec: int)
+# Marker: unique 8-byte NOP. The ELF symtab only carries the entry
+# symbol, so the build script finds this function by scanning .text
+# for this marker and backtracking to the prologue. Do not remove.
+asm
+raw 0x0F
+raw 0x1F
+raw 0x84
+raw 0x00
+raw 0x00
+raw 0x00
+raw 0x00
+raw 0x00
+end
+mut irq = vec - 32
+if irq == 0
+mut tp: raw *u64 = rawptr(0x74EC)
+tp[0] = tp[0] + 1
+if tp[0] % 500 == 0
+serial_write(0x77BE, 5)
+serial_u64(tp[0])
+serial_write(0x77C4, 2)
+end
+end
+if irq == 1
+kb_irq()
+end
+if irq >= 0
+if irq < 8
+outb(0x20, 0x20)
+end
+if irq >= 8
+if irq < 16
+outb(0xA0, 0x20)
+outb(0x20, 0x20)
+end
+end
+end
+end
+
+# ---------------- heap self-test ----------------
+fn heap_selftest() -> int
+mut l = list[int]()
+mut i: int = 0
+while i < 100
+l.push(i * 3 + 1)
+i = i + 1
+end
+mut ok: int = 1
+mut j: int = 0
+while j < 100
+if l[j] != j * 3 + 1
+ok = 0
+end
+j = j + 1
+end
+return ok
+end
+
+# ---------------- shell ----------------
+fn str_eq(a: u64, b: u64) -> int
+mut i: u64 = 0
+mut eq: int = 1
+mut go: u64 = 1
+while go == 1
+mut pa: raw *u8 = rawptr(a + i)
+mut pb: raw *u8 = rawptr(b + i)
+if pa[0] != pb[0]
+eq = 0
+go = 0
+else
+if pa[0] == 0
+go = 0
+else
+i = i + 1
+end
+end
+end
+return eq
+end
+
+fn shell_readline() -> u64
+mut len: u64 = 0
+mut done: u64 = 0
+while done == 0
+xhci_poll()
+if kb_has() == 1
+mut ch: u8 = kb_get()
+if ch == 10
+con_putc(10)
+done = 1
+else
+if ch == 8
+if len > 0
+len = len - 1
+con_backspace()
+end
+else
+if len < 120
+mut p: raw *u8 = rawptr(0x7634 + len)
+p[0] = ch
+len = len + 1
+con_putc(ch)
+end
+end
+end
+end
+end
+mut p: raw *u8 = rawptr(0x7634 + len)
+p[0] = 0
+return len
+end
+
+fn shell_say(args: u64, has_args: u64)
+if has_args == 1
+con_write(args)
+end
+con_putc(10)
+end
+
+fn shell_help()
+con_write(0x7813)
+con_putc(10)
+con_write(0x781D)
+con_putc(10)
+con_write(0x7838)
+con_putc(10)
+con_write(0x7856)
+con_putc(10)
+con_write(0x7872)
+con_putc(10)
+con_write(0x788F)
+con_putc(10)
+con_write(0x7894)
+con_putc(10)
+end
+
+fn shell_notimpl(line: u64)
+con_write(0x77DC)
+con_write(line)
+con_putc(10)
+end
+
+fn shell_exec(line: u64)
+mut sp: u64 = 0
+mut found: u64 = 0
+mut go: u64 = 1
+while go == 1
+mut p: raw *u8 = rawptr(line + sp)
+if p[0] == 0
+go = 0
+else
+if p[0] == 32
+p[0] = 0
+found = 1
+go = 0
+else
+sp = sp + 1
+end
+end
+end
+mut args: u64 = line
+if found == 1
+args = line + sp + 1
+end
+if str_eq(line, 0x78B4) == 1
+shell_say(args, found)
+else
+if str_eq(line, 0x78B8) == 1
+shell_help()
+else
+if str_eq(line, 0x78BD) == 1
+con_clear()
+else
+if str_eq(line, 0x78C3) == 1
+outb(0x64, 0xFE)
+mut spin: u64 = 0
+while spin == 0
+asm
+raw 0xF4
+end
+end
+else
+if str_eq(line, 0x78CB) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x78CF) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x78D4) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x78D8) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x78DE) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x78E3) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x78E8) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x78ED) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x78F4) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x78F9) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x78FE) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x7903) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x7909) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x7910) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x7916) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x791B) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x7921) == 1
+shell_notimpl(line)
+else
+if str_eq(line, 0x7926) == 1
+shell_notimpl(line)
+else
+con_write(0x77CA)
+con_write(line)
+con_putc(10)
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+
+fn shell()
+mut go: u64 = 1
+while go == 1
+con_write(0x77C7)
+mut n: u64 = shell_readline()
+if n > 0
+shell_exec(0x7634)
+end
+end
+end
+
+# ---------------- kernel entry ----------------
+fn kmain(mbi: raw *u8)
+mut off = 8
+mut fb_addr: u64 = 0
+mut pitch: u32 = 0
+mut width: u32 = 0
+mut height: u32 = 0
+mut bpp: u8 = 0
+mut found = 0
+while found == 0
+mut typ: u16 = read_u16(mbi, off)
+mut size: u32 = read_u32(mbi, off + 4)
+if typ == 0
+found = 2
+end
+if typ == 8
+fb_addr = read_u64(mbi, off + 8)
+pitch = read_u32(mbi, off + 16)
+width = read_u32(mbi, off + 20)
+height = read_u32(mbi, off + 24)
+bpp = mbi[off + 28]
+found = 1
+end
+if found == 0
+off = off + ((size + 7) / 8) * 8
+end
+end
+
+if found == 1
+if bpp == 32
+if width > 500
+if height > 400
+poke64(0x74E0, fb_addr)
+poke32(0x74E8, pitch / 4)
+mut fb: raw *u32 = rawptr(fb_addr)
+mut stride: u32 = pitch / 4
+mut y: u32 = 0
+while y < height
+mut x: u32 = 0
+while x < width
+fb[y * stride + x] = 4128
+x = x + 1
+end
+y = y + 1
+end
+poke64(0x7514, 0)
+poke64(0x751C, 0)
+poke64(0x7504, 0)
+poke64(0x750C, 0)
+poke64(0x7524, 0)
+poke64(0x752C, 0)
+con_write(0x77B4)
+con_putc(10)
+build_idt()
+load_idt()
+pic_remap()
+pit_init()
+kb_drain()
+if heap_selftest() == 1
+con_write(0x77F2)
+con_putc(10)
+else
+con_write(0x77FA)
+con_putc(10)
+asm
+raw 0xFA
+end
+mut spin: u64 = 0
+while spin == 0
+asm
+raw 0xF4
+end
+end
+end
+con_write(0x7804)
+con_putc(10)
+mut xhr: int = xhci_init()
+if xhr == 1
+xhr = xhci_enumerate()
+end
+if xhr == 1
+con_write(0x7936)
+con_putc(10)
+else
+con_write(0x794b)
+con_putc(10)
+end
+irq_enable()
+shell()
+end
+end
+end
+end
+end
+# ---------------- xHCI USB host controller ----------------
+# Written in Orum. All controller structures at XHCI_BASE = 0x1100000
+# (identity-mapped by the trampoline's 0-4GB page tables).
+#   +0x0000 DCBAA (64B) | +0x0040 input ctx (256B) | +0x0140 device ctx (256B)
+#   +0x0240 cmd ring (16 TRBs) | +0x0340 ERST (16B) | +0x0380 event ring (32 TRBs)
+#   +0x0580 EP0 xfer ring (16 TRBs) | +0x0680 intr-in xfer ring (16 TRBs)
+#   +0x0780 control data (256B) | +0x0880 HID report (cur 8 + prev 8)
+#   +0x0890 driver state:
+#     +0 mmio | +8 caplen | +16 dboff | +24 rtsoff | +32 opbase
+#     +40 cmd_pos | +48 cmd_cycle | +56 ep0_pos | +64 ep0_cycle
+#     +72 ep1_pos | +80 ep1_cycle | +88 evt_pos | +96 evt_cycle
+#     +104 slot | +112 intr_dci | +120 usb_ready | +128 speed
+#     +136 ps2_off | +144 mps0
+
+fn xh_st(o: u64) -> u64
+return peek64(0x1100890 + o)
+end
+
+fn xh_stw(o: u64, v: u64)
+poke64(0x1100890 + o, v)
+end
+
+fn peek8(addr: u64) -> u8
+mut p: raw *u8 = rawptr(addr)
+return p[0]
+end
+
+fn slog(s: u64)
+mut i: u64 = 0
+mut go: u64 = 1
+while go == 1
+mut p: raw *u8 = rawptr(s + i)
+if p[0] == 0
+go = 0
+else
+serial_putc(p[0])
+i = i + 1
+end
+end
+end
+
+fn shex(v: u64)
+slog(0x7978)
+mut t: u64 = v
+mut i: u64 = 0
+while i < 16
+mut nib: u64 = (t >> 60) & 15
+mut ch: u8 = nib + 48
+if nib > 9
+ch = nib + 87
+end
+serial_putc(ch)
+t = t << 4
+i = i + 1
+end
+end
+
+fn xh_stage(n: u64)
+slog(0x797B)
+serial_u64(n)
+serial_putc(10)
+end
+
+# ---------------- 32-bit port I/O (for PCI config) ----------------
+fn outd(port: u16, val: u32)
+asm
+in port = rdx
+in val = eax
+raw 0xEF
+end
+end
+
+fn ind(port: u16) -> u32
+mut v: u64 = 0
+asm
+in port = rdx
+raw 0xED
+out v = rax
+end
+mut r: u32 = v & 0xFFFFFFFF
+return r
+end
+
+# ---------------- PCI ----------------
+fn pci_cfg(bus: u64, dev: u64, func: u64, off: u64) -> u32
+mut bu: u32 = bus & 255
+mut du: u32 = dev & 31
+mut fu: u32 = func & 7
+mut ou: u32 = off & 252
+return 0x80000000 | (bu << 16) | (du << 11) | (fu << 8) | ou
+end
+
+fn pci_read(bus: u64, dev: u64, func: u64, off: u64) -> u32
+outd(0xCF8, pci_cfg(bus, dev, func, off))
+return ind(0xCFC)
+end
+
+fn pci_write(bus: u64, dev: u64, func: u64, off: u64, val: u32)
+outd(0xCF8, pci_cfg(bus, dev, func, off))
+outd(0xCFC, val)
+end
+
+fn xhci_find() -> u64
+mut bus: u64 = 0
+while bus < 256
+mut dev: u64 = 0
+while dev < 32
+if pci_read(bus, dev, 0, 0) != 0xFFFFFFFF
+mut f: u64 = 0
+while f < 8
+if (pci_read(bus, dev, f, 8) >> 8) == 0x0C0330
+mut cmd: u32 = pci_read(bus, dev, f, 4)
+pci_write(bus, dev, f, 4, cmd | 6)
+mut bar0: u32 = pci_read(bus, dev, f, 16)
+mut base: u64 = bar0 & 0xFFFFFFF0
+if (bar0 & 6) == 4
+mut b1: u64 = pci_read(bus, dev, f, 20)
+base = base | (b1 << 32)
+end
+return base
+end
+f = f + 1
+end
+end
+dev = dev + 1
+end
+bus = bus + 1
+end
+return 0
+end
+
+# ---------------- TRB + wait helpers ----------------
+fn xh_trb(addr: u64, lo: u64, dw2: u32, dw3: u32)
+poke64(addr, lo)
+poke32(addr + 8, dw2)
+poke32(addr + 12, dw3)
+end
+
+fn xh_wait_clr(addr: u64, mask: u32) -> int
+mut to: u64 = 5000000
+while to > 0
+if (peek32(addr) & mask) == 0
+return 1
+end
+to = to - 1
+end
+return 0
+end
+
+# ---------------- xHCI init ----------------
+fn xhci_init() -> int
+mut mmio: u64 = xhci_find()
+if mmio == 0
+return 0
+end
+xh_stw(0, mmio)
+slog(0x7961)
+shex(mmio)
+serial_putc(10)
+mut caplen: u64 = peek32(mmio) & 255
+xh_stw(8, caplen)
+mut op: u64 = mmio + caplen
+xh_stw(32, op)
+xh_stw(16, peek32(mmio + 20))
+xh_stw(24, peek32(mmio + 24))
+if (peek32(mmio + 16) & 4) == 4
+return 0
+end
+mut cmd: u32 = peek32(op)
+if (cmd & 1) == 1
+poke32(op, cmd & 0xFFFFFFFE)
+if xh_wait_clr(op + 4, 1) == 0
+return 0
+end
+end
+poke32(op, peek32(op) | 2)
+if xh_wait_clr(op, 2) == 0
+return 0
+end
+if xh_wait_clr(op + 4, 2048) == 0
+return 0
+end
+mut slots: u32 = peek32(mmio + 4) & 255
+if slots > 8
+slots = 8
+end
+poke32(op + 56, slots)
+mut i: u64 = 0
+while i < 8
+poke64(0x1100000 + i * 8, 0)
+i = i + 1
+end
+poke64(op + 48, 0x1100000)
+xh_trb(0x1100240 + 240, 0x1100240, 0, (6 << 10) | 2 | 1)
+xh_stw(40, 0)
+xh_stw(48, 1)
+xh_stw(56, 0)
+xh_stw(64, 1)
+xh_stw(144, 8)
+poke64(op + 24, 0x1100240 | 1)
+poke64(0x1100340, 0x1100380)
+poke32(0x1100348, 32)
+poke32(0x110034C, 0)
+mut rt: u64 = mmio + xh_st(24) + 32
+poke32(rt + 8, 1)
+poke32(rt + 12, 0)
+poke64(rt + 16, 0x1100340)
+poke32(rt + 20, 0)
+poke64(rt + 24, 0x1100380)
+poke32(rt + 28, 0)
+poke32(rt + 4, 0)
+xh_stw(88, 0)
+xh_stw(96, 1)
+xh_stw(120, 0)
+xh_stw(136, 0)
+poke32(op, peek32(op) | 1)
+if xh_wait_clr(op + 4, 1) == 0
+return 0
+end
+if xh_wait_clr(op + 4, 2048) == 0
+return 0
+end
+return 1
+end
+
+# ---------------- event ring ----------------
+fn xh_poll_evt() -> u64
+mut pos: u64 = xh_st(88)
+mut cyc: u64 = xh_st(96)
+mut addr: u64 = 0x1100380 + pos
+mut want: u32 = 0
+if cyc == 1
+want = 1
+end
+if (peek32(addr + 12) & 1) != want
+return 0
+end
+return addr
+end
+
+fn xh_evt_next()
+mut pos: u64 = xh_st(88) + 16
+mut cyc: u64 = xh_st(96)
+if pos >= 512
+pos = 0
+if cyc == 1
+cyc = 0
+else
+cyc = 1
+end
+end
+xh_stw(88, pos)
+xh_stw(96, cyc)
+mut rt: u64 = xh_st(0) + xh_st(24) + 32
+poke64(rt + 24, (0x1100380 + pos) | 8)
+end
+
+# ---------------- command ring ----------------
+fn xh_doorbell(slot: u64, val: u64)
+poke32(xh_st(0) + xh_st(16) + slot * 4, val)
+end
+
+fn xh_cmd(lo: u64, dw2: u32, dw3: u64)
+mut pos: u64 = xh_st(40)
+mut cyc: u64 = xh_st(48)
+mut addr: u64 = 0x1100240 + pos * 16
+mut c3: u64 = dw3 | cyc
+xh_trb(addr, lo, dw2, c3)
+pos = pos + 1
+if pos >= 15
+pos = 0
+if cyc == 1
+cyc = 0
+else
+cyc = 1
+end
+end
+xh_stw(40, pos)
+xh_stw(48, cyc)
+xh_doorbell(0, 0)
+end
+
+fn xh_wait_cmd() -> u64
+mut to: u64 = 5000000
+while to > 0
+mut ea: u64 = xh_poll_evt()
+if ea != 0
+mut ctrl: u32 = peek32(ea + 12)
+if ((ctrl >> 10) & 63) == 33
+mut code: u64 = (peek32(ea + 8) >> 24) & 255
+mut slot: u64 = (ctrl >> 24) & 255
+xh_evt_next()
+return (code << 32) | slot
+end
+xh_evt_next()
+end
+to = to - 1
+end
+return 0xFFFFFFFFFFFFFFFF
+end
+
+# ---------------- ports ----------------
+fn xh_find_port() -> u64
+mut nports: u64 = (peek32(xh_st(0) + 4) >> 24) & 255
+mut p: u64 = 1
+while p <= nports
+mut op: u64 = xh_st(32)
+mut pa: u64 = op + 1024 + (p - 1) * 16
+mut ps: u32 = peek32(pa)
+if (ps & 1) == 1
+poke32(pa, ps | 16)
+mut ok: u64 = 0
+mut to: u64 = 5000000
+while to > 0
+if (peek32(pa) & 16) == 0
+ok = 1
+to = 0
+else
+to = to - 1
+end
+end
+if ok == 1
+mut q: u32 = peek32(pa)
+poke32(pa, (q & 512) | 0x7E0000)
+mut r: u32 = peek32(pa)
+if (r & 1) == 1
+if (r & 2) == 2
+xh_stw(128, (r >> 10) & 15)
+xh_stw(148, p)
+return p
+end
+end
+end
+end
+p = p + 1
+end
+return 0
+end
+
+# ---------------- slots + addressing ----------------
+fn xh_enable_slot() -> u64
+xh_cmd(0, 0, 9 << 10)
+mut r: u64 = xh_wait_cmd()
+if r == 0xFFFFFFFFFFFFFFFF
+return 0
+end
+if ((r >> 32) & 255) != 1
+return 0
+end
+return r & 255
+end
+
+fn xh_epctx(base: u64, mps: u64, etype: u64, ring: u64, cyc: u64, interval: u64)
+poke32(base, interval << 16)
+poke32(base + 4, (6 | (etype << 3)) | (mps << 16))
+poke64(base + 8, ring | cyc)
+poke32(base + 12, 0)
+poke32(base + 16, 8)
+poke32(base + 20, 0)
+poke32(base + 24, 0)
+poke32(base + 28, 0)
+end
+
+fn xh_slotctx(entries: u64)
+poke32(0x1100060, (xh_st(128) << 20) | (entries << 27))
+poke32(0x1100064, xh_st(148) << 16)
+poke32(0x1100068, 0)
+poke32(0x110006C, 0)
+poke32(0x1100070, 0)
+poke32(0x1100074, 0)
+poke32(0x1100078, 0)
+poke32(0x110007C, 0)
+end
+
+fn xh_address(slot: u64) -> int
+poke64(0x1100000 + slot * 8, 0x1100140)
+poke32(0x1100040, 0)
+poke32(0x1100044, 3)
+xh_slotctx(1)
+xh_epctx(0x1100080, xh_st(144), 4, 0x1100580 + xh_st(56) * 16, xh_st(64), 0)
+xh_cmd(0x1100040, 0, (11 << 10) | (slot << 24))
+mut r: u64 = xh_wait_cmd()
+if r == 0xFFFFFFFFFFFFFFFF
+return 0
+end
+if ((r >> 32) & 255) != 1
+return 0
+end
+return 1
+end
+
+# ---------------- control transfers ----------------
+fn xh_ep0_trb(lo: u64, dw2: u32, dw3: u64)
+mut pos: u64 = xh_st(56)
+mut cyc: u64 = xh_st(64)
+mut addr: u64 = 0x1100580 + pos * 16
+mut c3: u64 = dw3 | cyc
+xh_trb(addr, lo, dw2, c3)
+pos = pos + 1
+if pos >= 15
+pos = 0
+if cyc == 1
+cyc = 0
+else
+cyc = 1
+end
+end
+xh_stw(56, pos)
+xh_stw(64, cyc)
+end
+
+fn xh_wait_xfer(epid: u64) -> u64
+mut to: u64 = 5000000
+while to > 0
+mut ea: u64 = xh_poll_evt()
+if ea != 0
+mut ctrl: u32 = peek32(ea + 12)
+if ((ctrl >> 10) & 63) == 32
+mut e: u64 = (ctrl >> 16) & 31
+if e == epid
+mut code: u64 = (peek32(ea + 8) >> 24) & 255
+xh_evt_next()
+return code
+end
+end
+xh_evt_next()
+end
+to = to - 1
+end
+return 255
+end
+
+fn xh_control(slot: u64, s0: u64, s1: u64, data: u64, ln: u64) -> int
+mut trt: u64 = s1 & 255
+mut ddir: u64 = (s1 >> 8) & 255
+xh_ep0_trb(s0, 8, (2 << 10) | (1 << 4) | (trt << 16))
+if ln > 0
+xh_ep0_trb(data, ln, (3 << 10) | (ddir << 16))
+end
+mut sdir: u64 = 1
+if ln > 0
+if ddir == 1
+sdir = 0
+end
+end
+xh_ep0_trb(0, 0, (4 << 10) | (1 << 5) | (sdir << 16))
+xh_doorbell(slot, 1)
+if xh_wait_xfer(1) != 1
+return 0
+end
+return 1
+end
+
+fn xh_get_desc(slot: u64, val: u64, ln: u64) -> int
+mut s0: u64 = 128 | (6 << 8) | (val << 16) | (ln << 48)
+return xh_control(slot, s0, 2 | (1 << 8), 0x1100780, ln)
+end
+
+fn xh_set_config(slot: u64, cfg: u64) -> int
+mut s0: u64 = (9 << 8) | (cfg << 16)
+return xh_control(slot, s0, 0, 0, 0)
+end
+
+fn xh_set_proto(slot: u64, iface: u64) -> int
+mut s0: u64 = 33 | (11 << 8) | (iface << 32)
+return xh_control(slot, s0, 0, 0, 0)
+end
+
+fn xh_config_ep(slot: u64, dci: u64, interval: u64) -> int
+mut dd: u32 = dci
+poke32(0x1100040, 0)
+poke32(0x1100044, 3 | (1 << dd))
+xh_slotctx(dci)
+xh_epctx(0x1100080, xh_st(144), 4, 0x1100580 + xh_st(56) * 16, xh_st(64), 0)
+xh_epctx(0x1100080 + (dci - 1) * 32, 8, 7, 0x1100680, 1, interval)
+xh_cmd(0x1100040, 0, (12 << 10) | (slot << 24))
+mut r: u64 = xh_wait_cmd()
+if r == 0xFFFFFFFFFFFFFFFF
+return 0
+end
+if ((r >> 32) & 255) != 1
+return 0
+end
+return 1
+end
+
+# ---------------- interrupt IN + HID ----------------
+fn xh_ring_intr()
+mut pos: u64 = xh_st(72)
+mut cyc: u64 = xh_st(80)
+mut addr: u64 = 0x1100680 + pos * 16
+mut c3: u64 = (1 << 10) | (1 << 16) | (1 << 5)
+if cyc == 1
+c3 = c3 | 1
+end
+xh_trb(addr, 0x1100880, 8, c3)
+pos = pos + 1
+if pos >= 15
+pos = 0
+if cyc == 1
+cyc = 0
+else
+cyc = 1
+end
+end
+xh_stw(72, pos)
+xh_stw(80, cyc)
+xh_doorbell(xh_st(104), xh_st(112))
+end
+
+fn xh_report()
+mut mod: u8 = peek8(0x1100880)
+mut shift: u64 = 0
+if (mod & 34) != 0
+shift = 1
+end
+mut tbl: u64 = 0x7988
+if shift == 1
+tbl = 0x7A88
+end
+mut i: u64 = 2
+while i < 8
+mut kc: u8 = peek8(0x1100880 + i)
+if kc != 0
+mut seen: u64 = 0
+mut j: u64 = 2
+while j < 8
+if peek8(0x1100888 + j) == kc
+seen = 1
+end
+j = j + 1
+end
+if seen == 0
+mut ku: u64 = kc
+mut ch: u8 = peek8(tbl + ku)
+if ch != 0
+kb_push(ch)
+slog(0x792B)
+serial_putc(ch)
+serial_putc(10)
+end
+end
+end
+i = i + 1
+end
+mut k: u64 = 0
+while k < 8
+poke8(0x1100888 + k, peek8(0x1100880 + k))
+k = k + 1
+end
+end
+
+fn xhci_poll()
+if xh_st(120) == 0
+return
+end
+mut go: u64 = 1
+while go == 1
+mut ea: u64 = xh_poll_evt()
+if ea == 0
+go = 0
+else
+mut ctrl: u32 = peek32(ea + 12)
+if ((ctrl >> 10) & 63) == 32
+mut e: u64 = (ctrl >> 16) & 31
+if e == xh_st(112)
+if ((peek32(ea + 8) >> 24) & 255) == 1
+xh_report()
+end
+xh_ring_intr()
+end
+end
+xh_evt_next()
+end
+end
+end
+
+# ---------------- enumeration ----------------
+fn xhci_enumerate() -> int
+mut port: u64 = xh_find_port()
+if port == 0
+return 0
+end
+xh_stage(1)
+mut slot: u64 = xh_enable_slot()
+if slot == 0
+return 0
+end
+xh_stw(104, slot)
+xh_stage(2)
+if xh_address(slot) == 0
+return 0
+end
+xh_stage(3)
+if xh_get_desc(slot, 0x0100, 18) != 1
+return 0
+end
+xh_stw(144, peek8(0x1100787))
+xh_stage(4)
+if xh_get_desc(slot, 0x0200, 9) != 1
+return 0
+end
+mut total: u64 = peek8(0x1100782) | (peek8(0x1100783) << 8)
+if total > 256
+total = 256
+end
+if xh_get_desc(slot, 0x0200, total) != 1
+return 0
+end
+xh_stage(5)
+mut ifnum: u64 = 99
+mut epaddr: u64 = 0
+mut epint: u64 = 0
+mut kbd: u64 = 0
+mut off: u64 = 0
+mut go: u64 = 1
+while go == 1
+if off >= total
+go = 0
+else
+mut blen: u64 = peek8(0x1100780 + off)
+if blen == 0
+go = 0
+else
+mut btype: u64 = peek8(0x1100780 + off + 1)
+if btype == 4
+kbd = 0
+if peek8(0x1100780 + off + 5) == 3
+if peek8(0x1100780 + off + 6) == 1
+if peek8(0x1100780 + off + 7) == 1
+ifnum = peek8(0x1100780 + off + 2)
+kbd = 1
+end
+end
+end
+end
+if btype == 5
+if kbd == 1
+if (peek8(0x1100780 + off + 2) & 128) == 128
+if (peek8(0x1100780 + off + 3) & 3) == 3
+epaddr = peek8(0x1100780 + off + 2)
+epint = peek8(0x1100780 + off + 6)
+end
+end
+end
+end
+off = off + blen
+end
+end
+end
+if ifnum == 99
+return 0
+end
+if epaddr == 0
+return 0
+end
+mut cfgval: u64 = peek8(0x1100780 + 5)
+if xh_set_config(slot, cfgval) != 1
+return 0
+end
+xh_stage(6)
+if xh_set_proto(slot, ifnum) != 1
+return 0
+end
+xh_stage(7)
+mut dci: u64 = (epaddr & 15) * 2 + 1
+xh_stw(112, dci)
+if xh_config_ep(slot, dci, epint) == 0
+return 0
+end
+xh_stw(72, 0)
+xh_stw(80, 1)
+xh_ring_intr()
+xh_stw(120, 1)
+xh_stw(136, 1)
+xh_stage(8)
+return 1
+end
