@@ -1,0 +1,312 @@
+# pcheck.orum — shared artifact-verification helpers for the prove tools.
+#
+# Declarations only: safe to `take` from any tool. P6 PPM parsing,
+# pixel reads, and byte-needle search over file buffers. Hosted only.
+#
+# The prove_*.py scripts orchestrate QEMU (subprocess, unix sockets,
+# sleeps) — none of which hosted Orum can do. What ports cleanly is
+# their assertion core: parse an artifact file, assert on its bytes.
+# Each prove_X.orum is therefore an OFFLINE verifier: you produce the
+# artifact (screendump PPM, serial log) however you like, then run the
+# tool on it. It prints PASS/FAIL and exits 0/1.
+
+fn is_space(c: u64) -> u64
+if c == 32
+return 1
+end
+if c == 10
+return 1
+end
+if c == 13
+return 1
+end
+if c == 9
+return 1
+end
+return 0
+end
+
+# Skip PPM whitespace and #-comments starting at i; returns new index.
+fn ppm_skip(buf: raw *u8, len: u64, i: u64) -> u64
+mut j: u64 = i
+mut done: u64 = 0
+while done == 0
+if j >= len
+done = 1
+else
+c: u64 = buf[j]
+if is_space(c) == 1
+j = j + 1
+else
+if c == 35
+j = j + 1
+mut eol: u64 = 0
+while eol == 0
+if j >= len
+eol = 1
+else
+if buf[j] == 10
+j = j + 1
+eol = 1
+else
+j = j + 1
+end
+end
+end
+else
+done = 1
+end
+end
+end
+end
+return j
+end
+
+# Parse a decimal number at buf[i]; sets out_next[0] past the last digit.
+fn ppm_num(buf: raw *u8, len: u64, i: u64, out_next: raw *u64) -> u64
+mut v: u64 = 0
+mut j: u64 = i
+mut done: u64 = 0
+while done == 0
+if j >= len
+done = 1
+else
+c: u64 = buf[j]
+if c >= 48
+if c <= 57
+v = v * 10 + (c - 48)
+j = j + 1
+else
+done = 1
+end
+else
+done = 1
+end
+end
+end
+out_next[0] = j
+return v
+end
+
+# Open a P6 PPM for pixel checks. The header must end within the first
+# 512 bytes of the file. Sets out_w/out_h and out_do[0] = file offset
+# where the pixel data starts. Returns the open fd (caller must fclose
+# it). Crashes on malformed input.
+#
+# NOTE: the pixel data is NOT buffered — a 1024x768 PPM is 2.25 MiB,
+# bigger than hosted Orum's 1 MiB heap. Pixels are read on demand with
+# ppm_pix_fd (fseek + 3-byte fread).
+fn ppm_open(path: str, out_w: raw *u64, out_h: raw *u64, out_do: raw *u64) -> int
+fd: int = fopen(path, "r")
+if fd < 0
+crash "cannot open ppm"
+end
+hdr: raw *u8 = heap_alloc(512)
+n: int = fread(fd, hdr, 512)
+if n <= 15
+crash "ppm header too short"
+end
+hlen: u64 = n
+if hdr[0] != 80
+crash "ppm: not P6"
+end
+if hdr[1] != 54
+crash "ppm: not P6"
+end
+mut ni: u64 = 0
+nip: raw *u64 = rawptr(addr(ni))
+mut i: u64 = ppm_skip(hdr, hlen, 2)
+w: u64 = ppm_num(hdr, hlen, i, nip)
+i = ppm_skip(hdr, hlen, ni)
+h: u64 = ppm_num(hdr, hlen, i, nip)
+i = ppm_skip(hdr, hlen, ni)
+maxv: u64 = ppm_num(hdr, hlen, i, nip)
+i = ppm_skip(hdr, hlen, ni)
+if maxv != 255
+crash "ppm: maxval not 255"
+end
+if w == 0
+crash "ppm: zero width"
+end
+if h == 0
+crash "ppm: zero height"
+end
+if i >= hlen
+crash "ppm: header runs past read buffer"
+end
+out_w[0] = w
+out_h[0] = h
+out_do[0] = i
+return fd
+end
+
+# Pixel at (x, y) as 0xRRGGBB, read via seek (no buffering).
+fn ppm_pix_fd(fd: int, data_off: u64, w: u64, x: u64, y: u64) -> u64
+mut slot: u64 = 0
+sp: raw *u8 = rawptr(addr(slot))
+fseek(fd, data_off + (y * w + x) * 3, 0)
+n: int = fread(fd, sp, 3)
+if n != 3
+crash "ppm: short pixel read"
+end
+return sp[0] * 65536 + sp[1] * 256 + sp[2]
+end
+
+# First occurrence of needle (nlen bytes) in haystack (hlen bytes).
+# Returns offset+1, or 0 if absent.
+fn find_sub(hay: raw *u8, hlen: u64, ndl: raw *u8, nlen: u64) -> u64
+if nlen == 0
+return 1
+end
+if nlen > hlen
+return 0
+end
+mut i: u64 = 0
+mut done: u64 = 0
+while done == 0
+if i + nlen > hlen
+done = 1
+else
+mut j: u64 = 0
+mut is_match: u64 = 1
+while j < nlen
+if hay[i + j] != ndl[j]
+is_match = 0
+j = nlen
+else
+j = j + 1
+end
+end
+if is_match == 1
+return i + 1
+end
+i = i + 1
+end
+end
+return 0
+end
+
+# Count pixels differing from bg (0xRRGGBB), sampling every step_x
+# pixels across the full height. (For the "screen is (nearly) all
+# background" checks.)
+fn count_nonbg_fd(fd: int, data_off: u64, w: u64, h: u64, bg: u64, step_x: u64) -> u64
+mut n: u64 = 0
+mut y: u64 = 0
+while y < h
+mut x: u64 = 0
+while x < w
+if ppm_pix_fd(fd, data_off, w, x, y) != bg
+n = n + 1
+end
+x = x + step_x
+end
+y = y + 1
+end
+return n
+end
+
+# 1 if needle present AND needle2 present after it; else 0.
+# (For "say hi" echoed, then "hi" on its own line.)
+fn seq_ok(log: raw *u8, log_len: u64, n1: raw *u8, l1: u64, n2: raw *u8, l2: u64) -> u64
+f: u64 = find_sub(log, log_len, n1, l1)
+if f == 0
+return 0
+end
+off: u64 = f - 1 + l1
+return needle_ok(log + off, log_len - off, n2, l2)
+end
+
+# 1 if needle (nlen bytes) is present in the log, else 0.
+fn needle_ok(log: raw *u8, log_len: u64, ndl: raw *u8, nlen: u64) -> u64
+if find_sub(log, log_len, ndl, nlen) == 0
+return 0
+end
+return 1
+end
+
+# "tick N" lines in a serial log: >= 2 lines, strictly increasing,
+# all on 100-tick boundaries. Returns 1 on pass, 0 on fail.
+# Prints the line count.
+fn check_ticks(log: raw *u8, log_len: u64) -> u64
+needle: raw *u8 = [116, 105, 99, 107, 32]
+mut off: u64 = 0
+mut count: u64 = 0
+mut prev: u64 = 0
+mut ok: u64 = 1
+mut done: u64 = 0
+while done == 0
+f: u64 = find_sub(log + off, log_len - off, needle, 5)
+if f == 0
+done = 1
+else
+mut p: u64 = off + f - 1 + 5
+mut val: u64 = 0
+mut digits: u64 = 0
+mut ddone: u64 = 0
+while ddone == 0
+if p >= log_len
+ddone = 1
+else
+c: u64 = log[p]
+if c >= 48
+if c <= 57
+val = val * 10 + (c - 48)
+digits = digits + 1
+p = p + 1
+else
+ddone = 1
+end
+else
+ddone = 1
+end
+end
+end
+if digits == 0
+ok = 0
+else
+if count > 0
+if val <= prev
+ok = 0
+end
+end
+if val % 100 != 0
+ok = 0
+end
+prev = val
+count = count + 1
+end
+off = p
+end
+end
+say(count)
+if count < 2
+return 0
+end
+return ok
+end
+
+# Read a whole file into a heap buffer. Sets out_len[0] to the size.
+# A missing file is NOT an error: out_len[0] = 0 and the null pointer
+# is returned (callers must not touch the buffer when the length is 0).
+fn read_all(path: str, out_len: raw *u64) -> raw *u8
+fd: int = fopen(path, "r")
+if fd < 0
+out_len[0] = 0
+nullp: raw *u8 = rawptr(0)
+return nullp
+end
+size: u64 = fseek(fd, 0, 2)
+fseek(fd, 0, 0)
+buf: raw *u8 = heap_alloc(size)
+mut got: u64 = 0
+while got < size
+n: int = fread(fd, buf + got, size - got)
+if n <= 0
+crash "short read"
+end
+got = got + n
+end
+fclose(fd)
+out_len[0] = size
+return buf
+end

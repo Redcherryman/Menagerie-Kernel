@@ -1,0 +1,169 @@
+# prove_kernel.orum — PROVE Menagerie v0.1 boots with live interrupts.
+#
+# Ports the assertion core of boot/prove_kernel.py. The Python script
+# builds the disk image, boots it in QEMU, and screendumps; hosted Orum
+# cannot spawn processes or talk to the QEMU monitor, so this tool
+# verifies already-produced artifacts instead:
+#   reads  k1.ppm       — P6 screendump 1, 1024x768
+#   reads  k2.ppm       — P6 screendump 2 (ticks advanced), 1024x768
+#   reads  kserial.log  — serial log bytes
+# ASSERTS:
+#   1. Console text "menagerie" rendered pixel-correct against the
+#      font data (via tools/font.orum — the ported build_font()).
+#   2. The tick counter ADVANCES between the two screendumps.
+#   3. The serial log shows the "menagerie" banner + strictly
+#      increasing "tick N" lines on 100-tick boundaries.
+# Prints PASS/FAIL, exits 0/1.
+#
+# Build with base_dir=tools so the takes resolve:
+#   compile_source(open("prove_kernel.orum").read(), base_dir="tools")
+
+take read_all from pcheck
+take ppm_open, ppm_pix_fd, find_sub, needle_ok, check_ticks from pcheck
+take font_glyph from font
+
+fn menagerie_glyph(ci: u64) -> u64
+idx: raw *u8 = [40, 32, 41, 28, 34, 32, 45, 36, 32]
+return idx[ci]
+end
+
+# Check 1: "menagerie" at (16,16), 9 glyphs, pixel-verified against the
+# font. Samples up to 6 set + 3 clear pixels per glyph (row > 0 for
+# clear). Returns mismatch count.
+fn check_text(fd: int, doff: u64, w: u64) -> u64
+mut fails: u64 = 0
+mut checked: u64 = 0
+mut ci: u64 = 0
+while ci < 9
+g: raw *u8 = font_glyph(menagerie_glyph(ci))
+gx: u64 = 16 + ci * 8
+mut set_checked: u64 = 0
+mut clear_checked: u64 = 0
+mut row: u64 = 0
+while row < 16
+byte: u64 = g[row]
+mut col: u64 = 0
+while col < 8
+is_set: u64 = (byte >> (7 - col)) & 1
+got: u64 = ppm_pix_fd(fd, doff, w, gx + col, 16 + row)
+if is_set == 1
+if set_checked < 6
+if got != 16777215
+fails = fails + 1
+end
+set_checked = set_checked + 1
+checked = checked + 1
+end
+else
+if row > 0
+if clear_checked < 3
+if got != 4128
+fails = fails + 1
+end
+clear_checked = clear_checked + 1
+checked = checked + 1
+end
+end
+end
+col = col + 1
+end
+row = row + 1
+end
+ci = ci + 1
+end
+say(checked)
+return fails
+end
+
+# Check 2: tick advances between dumps. Returns 0 on pass, 1 on fail.
+fn check_tick(fd1: int, fd2: int, doff1: u64, doff2: u64, w: u64) -> u64
+mut label_live: u64 = 0
+mut y: u64 = 40
+while y < 56
+mut x: u64 = 16
+while x < 56
+if ppm_pix_fd(fd1, doff1, w, x, y) != 4128
+label_live = label_live + 1
+end
+x = x + 1
+end
+y = y + 1
+end
+if label_live < 20
+say(label_live)
+return 1
+end
+mut diff: u64 = 0
+y = 40
+while y < 56
+x = 56
+while x < 216
+if ppm_pix_fd(fd1, doff1, w, x, y) != ppm_pix_fd(fd2, doff2, w, x, y)
+diff = diff + 1
+end
+x = x + 1
+end
+y = y + 1
+end
+say(diff)
+if diff < 30
+return 1
+end
+return 0
+end
+
+fn _start()
+mut w1: u64 = 0
+mut h1: u64 = 0
+mut doff1: u64 = 0
+w1p: raw *u64 = rawptr(addr(w1))
+h1p: raw *u64 = rawptr(addr(h1))
+doff1p: raw *u64 = rawptr(addr(doff1))
+fd1: int = ppm_open("k1.ppm", w1p, h1p, doff1p)
+mut w2: u64 = 0
+mut h2: u64 = 0
+mut doff2: u64 = 0
+w2p: raw *u64 = rawptr(addr(w2))
+h2p: raw *u64 = rawptr(addr(h2))
+doff2p: raw *u64 = rawptr(addr(doff2))
+fd2: int = ppm_open("k2.ppm", w2p, h2p, doff2p)
+if w1 != 1024
+crash "bad k1 width"
+end
+if h1 != 768
+crash "bad k1 height"
+end
+if w2 != 1024
+crash "bad k2 width"
+end
+if h2 != 768
+crash "bad k2 height"
+end
+mut log_len: u64 = 0
+log_lenp: raw *u64 = rawptr(addr(log_len))
+log: raw *u8 = read_all("kserial.log", log_lenp)
+if log_len == 0
+crash "cannot open kserial.log"
+end
+mut fails: u64 = 0
+fails = fails + check_text(fd1, doff1, w1)
+fails = fails + check_tick(fd1, fd2, doff1, doff2, w1)
+fclose(fd1)
+fclose(fd2)
+banner: raw *u8 = [109, 101, 110, 97, 103, 101, 114, 105, 101, 13, 10]
+if needle_ok(log, log_len, banner, 11) == 0
+say("no banner")
+fails = fails + 1
+end
+if check_ticks(log, log_len) == 0
+say("bad ticks")
+fails = fails + 1
+end
+if fails == 0
+say("PASS: kernel boots, console works, timer IRQ live")
+exit(0)
+end
+say("FAIL:")
+say(fails)
+exit(1)
+end

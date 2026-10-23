@@ -1,0 +1,82 @@
+# prove_xhci.orum — assert the Menagerie xHCI USB keyboard driver works.
+#
+# Ports the assertion core of boot/prove_xhci.py. The Python script boots
+# the kernel twice in QEMU (with/without usb-kbd) and greps the serial
+# logs; hosted Orum cannot spawn processes, so this tool verifies
+# already-produced logs instead:
+#   reads  xhci-with.log     — serial log, boot WITH usb-kbd attached
+#   reads  xhci-without.log  — serial log, boot WITHOUT usb-kbd
+# ASSERTS (mirroring prove_xhci.py):
+#   with:    "xhci: keyboard ready", all 8 init stages reached,
+#            no "TRB Error", no "completion code 5"
+#   without: "no usb keyboard" (graceful), ">" shell prompt present
+# Prints PASS/FAIL per assertion, exits 0/1.
+#
+# Build with base_dir=tools so the takes resolve:
+#   compile_source(open("prove_xhci.orum").read(), base_dir="tools")
+
+take read_all from pcheck
+take needle_ok from pcheck
+
+fn load_log(path: str, out_len: raw *u64) -> raw *u8
+mut len: u64 = 0
+lenp: raw *u64 = rawptr(addr(len))
+buf: raw *u8 = read_all(path, lenp)
+if len == 0
+crash "cannot open log"
+end
+out_len[0] = len
+return buf
+end
+
+fn _start()
+mut l1: u64 = 0
+l1p: raw *u64 = rawptr(addr(l1))
+log1: raw *u8 = load_log("xhci-with.log", l1p)
+mut l2: u64 = 0
+l2p: raw *u64 = rawptr(addr(l2))
+log2: raw *u8 = load_log("xhci-without.log", l2p)
+mut fails: u64 = 0
+n_xhci: raw *u8 = [120, 104, 99, 105]
+if needle_ok(log1, l1, n_xhci, 4) == 0
+say("controller banner missing")
+fails = fails + 1
+end
+n_ready: raw *u8 = [120, 104, 99, 105, 58, 32, 107, 101, 121, 98, 111, 97, 114, 100]
+if needle_ok(log1, l1, n_ready, 14) == 0
+say("keyboard ready missing")
+fails = fails + 1
+end
+n_stage8: raw *u8 = [115, 116, 97, 103, 101, 32, 56]
+if needle_ok(log1, l1, n_stage8, 7) == 0
+say("stage 8 not reached")
+fails = fails + 1
+end
+n_trberr: raw *u8 = [84, 82, 66, 32, 69, 114, 114, 111, 114]
+if needle_ok(log1, l1, n_trberr, 9) == 1
+say("TRB Error in log")
+fails = fails + 1
+end
+n_cc5: raw *u8 = [99, 111, 109, 112, 108, 101, 116, 105, 111, 110, 32, 99, 111, 100, 101, 32, 53]
+if needle_ok(log1, l1, n_cc5, 17) == 1
+say("completion code 5 in log")
+fails = fails + 1
+end
+n_nousb: raw *u8 = [110, 111, 32, 117, 115, 98, 32, 107, 101, 121, 98, 111, 97, 114, 100]
+if needle_ok(log2, l2, n_nousb, 15) == 0
+say("no-usb graceful message missing")
+fails = fails + 1
+end
+n_prompt: raw *u8 = [62]
+if needle_ok(log2, l2, n_prompt, 1) == 0
+say("shell prompt missing without USB")
+fails = fails + 1
+end
+if fails == 0
+say("PASS: all xHCI assertions passed")
+exit(0)
+end
+say("FAIL:")
+say(fails)
+exit(1)
+end

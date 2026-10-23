@@ -1,0 +1,121 @@
+# prove_uefi.orum — PROVE the Menagerie UEFI loader (offline verifier).
+#
+# Ports the assertion core of boot/uefi/prove_uefi.py. The Python script
+# builds BOOTX64.EFI + FAT image, boots QEMU with OVMF, drives the shell
+# via the monitor, and screendumps; hosted Orum cannot spawn processes,
+# sleep, or talk to the QEMU monitor, so this tool verifies
+# already-produced artifacts instead:
+#   reads  v03serial.log  — serial log bytes from the OVMF session
+#   reads  v03-shell.ppm  — P6 screendump of the shell, 1024x768
+# ASSERTS (mirroring prove_uefi.py's checks 1-6, minus live driving):
+#   1. UEFI loader milestones: GOP located, mode set, kernel copied,
+#      boot services exited
+#   2+3. "menagerie", "heap ok", "keyboard ready"; no "heap FAIL"
+#   4.   "say hi" echoed, then "hi" on its own line
+#   5.   "commands:" (help lists commands)
+#   6.   "tick N" lines strictly increasing on 100-tick boundaries
+#   shot. shell screenshot shows text (>= 100 live pixels, top rows)
+# Prints PASS/FAIL, exits 0/1.
+#
+# Build with base_dir=tools so the takes resolve:
+#   compile_source(open("prove_uefi.orum").read(), base_dir="tools")
+
+take read_all from pcheck
+take ppm_open, ppm_pix_fd, find_sub, needle_ok, seq_ok, check_ticks from pcheck
+
+fn _start()
+mut log_len: u64 = 0
+log_lenp: raw *u64 = rawptr(addr(log_len))
+log: raw *u8 = read_all("v03serial.log", log_lenp)
+if log_len == 0
+crash "cannot open v03serial.log"
+end
+mut fails: u64 = 0
+n_gop: raw *u8 = [85, 69, 70, 73, 58, 32, 71, 79, 80, 32, 108, 111, 99, 97, 116, 101, 100]
+if needle_ok(log, log_len, n_gop, 17) == 0
+say("missing GOP located")
+fails = fails + 1
+end
+n_mode: raw *u8 = [85, 69, 70, 73, 58, 32, 109, 111, 100, 101, 32, 49, 48, 50, 52, 120, 55, 54, 56, 120, 51, 50, 32, 115, 101, 116]
+if needle_ok(log, log_len, n_mode, 26) == 0
+say("missing mode set")
+fails = fails + 1
+end
+n_copied: raw *u8 = [85, 69, 70, 73, 58, 32, 107, 101, 114, 110, 101, 108, 32, 99, 111, 112, 105, 101, 100]
+if needle_ok(log, log_len, n_copied, 19) == 0
+say("missing kernel copied")
+fails = fails + 1
+end
+n_ebs: raw *u8 = [85, 69, 70, 73, 58, 32, 98, 111, 111, 116, 32, 115, 101, 114, 118, 105, 99, 101, 115, 32, 101, 120, 105, 116, 101, 100]
+if needle_ok(log, log_len, n_ebs, 26) == 0
+say("missing boot services exited")
+fails = fails + 1
+end
+n_menagerie: raw *u8 = [109, 101, 110, 97, 103, 101, 114, 105, 101]
+if needle_ok(log, log_len, n_menagerie, 9) == 0
+say("missing menagerie")
+fails = fails + 1
+end
+n_heapok: raw *u8 = [104, 101, 97, 112, 32, 111, 107]
+if needle_ok(log, log_len, n_heapok, 7) == 0
+say("missing heap ok")
+fails = fails + 1
+end
+n_heapfail: raw *u8 = [104, 101, 97, 112, 32, 70, 65, 73, 76]
+if needle_ok(log, log_len, n_heapfail, 9) == 1
+say("heap FAIL in log")
+fails = fails + 1
+end
+n_kbready: raw *u8 = [107, 101, 121, 98, 111, 97, 114, 100, 32, 114, 101, 97, 100, 121]
+if needle_ok(log, log_len, n_kbready, 14) == 0
+say("missing keyboard ready")
+fails = fails + 1
+end
+n_sayhi: raw *u8 = [115, 97, 121, 32, 104, 105]
+n_hiline: raw *u8 = [10, 104, 105, 13, 10]
+if seq_ok(log, log_len, n_sayhi, 6, n_hiline, 5) == 0
+say("say hi failed")
+fails = fails + 1
+end
+n_commands: raw *u8 = [99, 111, 109, 109, 97, 110, 100, 115, 58]
+if needle_ok(log, log_len, n_commands, 9) == 0
+say("missing commands:")
+fails = fails + 1
+end
+if check_ticks(log, log_len) == 0
+say("bad ticks")
+fails = fails + 1
+end
+mut w: u64 = 0
+mut h: u64 = 0
+mut doff: u64 = 0
+wp: raw *u64 = rawptr(addr(w))
+hp: raw *u64 = rawptr(addr(h))
+dop: raw *u64 = rawptr(addr(doff))
+fds: int = ppm_open("v03-shell.ppm", wp, hp, dop)
+mut live: u64 = 0
+mut yy: u64 = 0
+while yy < 200
+mut xx: u64 = 0
+while xx < 1024
+if ppm_pix_fd(fds, doff, w, xx, yy) != 4128
+live = live + 1
+end
+xx = xx + 4
+end
+yy = yy + 1
+end
+say(live)
+if live < 100
+say("shell shot shows no text")
+fails = fails + 1
+end
+fclose(fds)
+if fails == 0
+say("PASS: UEFI loader boots the kernel")
+exit(0)
+end
+say("FAIL:")
+say(fails)
+exit(1)
+end

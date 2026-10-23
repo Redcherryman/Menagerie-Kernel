@@ -1,0 +1,141 @@
+# prove_v02.orum — PROVE Menagerie v0.2: keyboard, heap, shell.
+#
+# Ports the assertion core of boot/prove_v02.py. The Python script builds
+# the disk image, boots it in QEMU, drives the shell via the monitor's
+# sendkey, and screendumps; hosted Orum cannot spawn processes, sleep,
+# or talk to the QEMU monitor, so this tool verifies already-produced
+# artifacts instead:
+#   reads  v02serial.log  — serial log bytes from the session
+#   reads  v02-shell.ppm  — P6 screendump after the help output, 1024x768
+#   reads  v02-clear.ppm  — P6 screendump after `clear`, 1024x768
+# ASSERTS (mirroring prove_v02.py's checks 1-10, minus the live driving):
+#   1-3. "menagerie", "heap ok", "keyboard ready" present; no "heap FAIL"
+#   4.   "say hi" echoed, then "hi" on its own line
+#   5.   help text needles
+#   6.   "unknown command: frobnicate"
+#   7.   "not implemented yet: list"
+#   8.   backspace editing left "ac" on a line
+#   9.   shell shot shows text; clear shot is (nearly) all background
+#   10.  "tick N" lines strictly increasing on 100-tick boundaries
+# Prints PASS/FAIL, exits 0/1.
+#
+# Build with base_dir=tools so the takes resolve:
+#   compile_source(open("prove_v02.orum").read(), base_dir="tools")
+
+take read_all from pcheck
+take ppm_open, ppm_pix_fd, find_sub, needle_ok, seq_ok, check_ticks, count_nonbg_fd from pcheck
+
+fn _start()
+mut log_len: u64 = 0
+log_lenp: raw *u64 = rawptr(addr(log_len))
+log: raw *u8 = read_all("v02serial.log", log_lenp)
+if log_len == 0
+crash "cannot open v02serial.log"
+end
+mut fails: u64 = 0
+n_menagerie: raw *u8 = [109, 101, 110, 97, 103, 101, 114, 105, 101]
+if needle_ok(log, log_len, n_menagerie, 9) == 0
+say("missing menagerie")
+fails = fails + 1
+end
+n_heapok: raw *u8 = [104, 101, 97, 112, 32, 111, 107]
+if needle_ok(log, log_len, n_heapok, 7) == 0
+say("missing heap ok")
+fails = fails + 1
+end
+n_kbready: raw *u8 = [107, 101, 121, 98, 111, 97, 114, 100, 32, 114, 101, 97, 100, 121]
+if needle_ok(log, log_len, n_kbready, 14) == 0
+say("missing keyboard ready")
+fails = fails + 1
+end
+n_heapfail: raw *u8 = [104, 101, 97, 112, 32, 70, 65, 73, 76]
+if needle_ok(log, log_len, n_heapfail, 9) == 1
+say("heap FAIL in log")
+fails = fails + 1
+end
+n_sayhi: raw *u8 = [115, 97, 121, 32, 104, 105]
+n_hiline: raw *u8 = [10, 104, 105, 13, 10]
+if seq_ok(log, log_len, n_sayhi, 6, n_hiline, 5) == 0
+say("say hi failed")
+fails = fails + 1
+end
+n_commands: raw *u8 = [99, 111, 109, 109, 97, 110, 100, 115, 58]
+if needle_ok(log, log_len, n_commands, 9) == 0
+say("missing commands:")
+fails = fails + 1
+end
+n_help1: raw *u8 = [115, 97, 121, 32, 104, 101, 108, 112, 32, 99, 108, 101, 97, 114, 32, 114, 101, 115, 116, 97, 114, 116, 32, 111, 102, 102]
+if needle_ok(log, log_len, n_help1, 26) == 0
+say("missing help line 1")
+fails = fails + 1
+end
+n_help2: raw *u8 = [108, 105, 115, 116, 32, 114, 117, 110, 32, 119, 104, 101, 114, 101, 32, 99, 111, 112, 121, 32, 109, 111, 118, 101, 32, 98, 117, 114, 110]
+if needle_ok(log, log_len, n_help2, 29) == 0
+say("missing help line 2")
+fails = fails + 1
+end
+n_help3: raw *u8 = [102, 105, 108, 101, 32, 99, 111, 109, 109, 97, 110, 100, 115, 32, 110, 101, 101, 100, 32, 97, 32, 102, 105, 108, 101, 115, 121, 115, 116, 101, 109]
+if needle_ok(log, log_len, n_help3, 31) == 0
+say("missing help line 3")
+fails = fails + 1
+end
+n_unknown: raw *u8 = [117, 110, 107, 110, 111, 119, 110, 32, 99, 111, 109, 109, 97, 110, 100, 58, 32, 102, 114, 111, 98, 110, 105, 99, 97, 116, 101]
+if needle_ok(log, log_len, n_unknown, 27) == 0
+say("missing unknown command")
+fails = fails + 1
+end
+n_notimpl: raw *u8 = [110, 111, 116, 32, 105, 109, 112, 108, 101, 109, 101, 110, 116, 101, 100, 32, 121, 101, 116, 58, 32, 108, 105, 115, 116]
+if needle_ok(log, log_len, n_notimpl, 25) == 0
+say("missing not implemented")
+fails = fails + 1
+end
+n_ac: raw *u8 = [97, 99, 13, 10]
+if needle_ok(log, log_len, n_ac, 4) == 0
+say("backspace check failed")
+fails = fails + 1
+end
+if check_ticks(log, log_len) == 0
+say("bad ticks")
+fails = fails + 1
+end
+mut w: u64 = 0
+mut h: u64 = 0
+mut doff: u64 = 0
+wp: raw *u64 = rawptr(addr(w))
+hp: raw *u64 = rawptr(addr(h))
+dop: raw *u64 = rawptr(addr(doff))
+fds: int = ppm_open("v02-shell.ppm", wp, hp, dop)
+mut live: u64 = 0
+mut yy: u64 = 0
+while yy < 200
+mut xx: u64 = 0
+while xx < 1024
+if ppm_pix_fd(fds, doff, w, xx, yy) != 4128
+live = live + 1
+end
+xx = xx + 4
+end
+yy = yy + 1
+end
+say(live)
+if live < 100
+say("shell shot shows no text")
+fails = fails + 1
+end
+fclose(fds)
+fdc: int = ppm_open("v02-clear.ppm", wp, hp, dop)
+total: u64 = w * h
+nonbg: u64 = count_nonbg_fd(fdc, doff, w, h, 4128, 8)
+fclose(fdc)
+if nonbg * 800 > total
+say("screen not cleared")
+fails = fails + 1
+end
+if fails == 0
+say("PASS: v0.2 keyboard, heap, shell proven")
+exit(0)
+end
+say("FAIL:")
+say(fails)
+exit(1)
+end

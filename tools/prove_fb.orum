@@ -1,0 +1,63 @@
+# prove_fb.orum — PROVE the Orum framebuffer pixel (offline verifier).
+#
+# Ports the assertion core of boot/prove_fb.py. The Python script builds
+# fb_pixel.orum, boots it in QEMU, and screendumps; hosted Orum cannot
+# spawn processes or talk to the QEMU monitor, so this tool verifies an
+# already-produced screendump instead:
+#   reads  fb.ppm  — P6 screendump, 1024x768
+# Asserts the 11 exact pixels of prove_fb.EXPECT. Prints PASS/FAIL,
+# exits 0/1.
+#
+# Build with base_dir=tools so the takes resolve:
+#   compile_source(open("prove_fb.orum").read(), base_dir="tools")
+
+take ppm_open, ppm_pix_fd from pcheck
+
+# Returns 1 on mismatch (and prints it), 0 on match.
+fn check_pix(fd: int, doff: u64, w: u64, x: u64, y: u64, want: u64) -> u64
+got: u64 = ppm_pix_fd(fd, doff, w, x, y)
+if got == want
+return 0
+end
+say(x)
+say(y)
+say(got)
+say(want)
+return 1
+end
+
+fn _start()
+mut w: u64 = 0
+mut h: u64 = 0
+mut doff: u64 = 0
+wp: raw *u64 = rawptr(addr(w))
+hp: raw *u64 = rawptr(addr(h))
+dop: raw *u64 = rawptr(addr(doff))
+fd: int = ppm_open("fb.ppm", wp, hp, dop)
+if w != 1024
+crash "unexpected width"
+end
+if h != 768
+crash "unexpected height"
+end
+mut fails: u64 = 0
+fails = fails + check_pix(fd, doff, w, 10, 10, 16711680)
+fails = fails + check_pix(fd, doff, w, 100, 50, 65280)
+fails = fails + check_pix(fd, doff, w, 200, 100, 255)
+fails = fails + check_pix(fd, doff, w, 50, 200, 16777215)
+fails = fails + check_pix(fd, doff, w, 305, 302, 16776960)
+fails = fails + check_pix(fd, doff, w, 300, 300, 16776960)
+fails = fails + check_pix(fd, doff, w, 405, 105, 16711935)
+fails = fails + check_pix(fd, doff, w, 400, 100, 16711935)
+fails = fails + check_pix(fd, doff, w, 0, 0, 4128)
+fails = fails + check_pix(fd, doff, w, 500, 500, 4128)
+fails = fails + check_pix(fd, doff, w, 700, 700, 4128)
+fclose(fd)
+if fails == 0
+say("PASS: all 11 pixels correct")
+exit(0)
+end
+say("FAIL: pixel mismatches:")
+say(fails)
+exit(1)
+end
