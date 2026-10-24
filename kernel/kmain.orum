@@ -386,15 +386,25 @@ end
 end
 
 # ---------------- interrupts ----------------
+fn get_cs() -> u64
+mut v: u64 = 0
+asm
+raw 0x48, 0x8C, 0xC8
+out v = rax
+end
+return v
+end
+
 fn build_idt()
+mut cs: u64 = get_cs()
 mut v: u64 = 0
 while v < 256
 mut stub: u64 = 24576 + v * 16
 mut e: u64 = 20480 + v * 16
 poke8(e, stub & 0xFF)
 poke8(e + 1, (stub >> 8) & 0xFF)
-poke8(e + 2, 0x18)
-poke8(e + 3, 0)
+poke8(e + 2, cs & 0xFF)
+poke8(e + 3, (cs >> 8) & 0xFF)
 poke8(e + 4, 0)
 poke8(e + 5, 0x8E)
 poke8(e + 6, (stub >> 16) & 0xFF)
