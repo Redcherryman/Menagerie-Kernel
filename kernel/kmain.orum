@@ -1,5 +1,10 @@
-# menagerie v0.2 — keyboard, heap, shell. Written in Orum, freestanding.
+# menagerie v0.5 — keyboard, heap, shell, filesystem. Written in Orum, freestanding.
 # Entry: fn kmain(mbi), called by the loader's trampoline in 64-bit mode.
+#
+# Filesystem (v0.5): FAT16 reader (kernel/fat.orum) over a RAM disk.
+#   RAM disk at 0x3000000 (1MB, placed there by the bootloader/test harness).
+#   FAT name buffer at 0x7B90 (16B) | file scratch at 0x1500000 (64KB).
+take fat_valid, fat_root_entries, fat_entry_valid, fat_entry_first_byte, fat_entry_attr, fat_entry_cluster, fat_entry_size, fat_entry_name_eq, fat_find, fat_read_file, fat_entry_off, fat_total_sectors, fat_total_clusters, fat_free_clusters, fat_bps, fat_spc, fat_create, fat_delete, fat_write_file from fat
 #
 # Low memory (see docs/boot-contract.md):
 #   0x5000 IDT (4K, kernel builds it) | 0x6000 ISR stubs (256 x 16B)
@@ -596,6 +601,417 @@ con_write(line)
 con_putc(10)
 end
 
+# ---------------- filesystem (v0.5) ----------------
+# RAM disk at 0x3000000, placed there by the bootloader/test harness.
+# Name buffer 0x7B90 (16B) | pattern buffer 0x7BA0 (16B) |
+# file scratch 0x1500000 (64KB).
+fn fs_disk() -> u64
+return 0x3000000
+end
+
+fn fs_format_name(idx: u64)
+mut disk: raw *u8 = rawptr(fs_disk())
+mut off: u64 = fat_entry_off(disk, idx)
+mut ep: raw *u8 = disk + off
+mut bp: raw *u8 = rawptr(0x7B90)
+mut o: u64 = 0
+mut i: u64 = 0
+while i < 8
+mut ch: u8 = ep[i]
+if ch == 32
+i = 8
+else
+bp[o] = ch
+o = o + 1
+i = i + 1
+end
+end
+mut has_ext: u64 = 0
+mut j: u64 = 0
+while j < 3
+if ep[8 + j] != 32
+has_ext = 1
+end
+j = j + 1
+end
+if has_ext == 1
+bp[o] = 46
+o = o + 1
+j = 0
+while j < 3
+mut ch: u8 = ep[8 + j]
+if ch == 32
+j = 3
+else
+bp[o] = ch
+o = o + 1
+j = j + 1
+end
+end
+end
+bp[o] = 0
+end
+
+fn shell_list()
+mut disk: raw *u8 = rawptr(fs_disk())
+if fat_valid(disk) == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut n: u64 = fat_root_entries(disk)
+mut i: u64 = 0
+while i < n
+if fat_entry_first_byte(disk, i) == 0
+i = n
+else
+if fat_entry_valid(disk, i) == 1
+fs_format_name(i)
+con_write(0x7B90)
+con_putc(10)
+end
+i = i + 1
+end
+end
+end
+
+fn fs_build_pattern(args: u64, pp: raw *u8)
+mut i: u64 = 0
+while i < 11
+pp[i] = 32
+i = i + 1
+end
+mut ap: raw *u8 = rawptr(args)
+mut ni: u64 = 0
+mut ei: u64 = 0
+mut in_ext: u64 = 0
+mut go: u64 = 1
+mut ai: u64 = 0
+while go == 1
+mut ch: u8 = ap[ai]
+if ch == 0
+go = 0
+else
+if ch == 46
+in_ext = 1
+ei = 0
+else
+if ch >= 97
+if ch <= 122
+ch = ch - 32
+end
+end
+if in_ext == 0
+if ni < 8
+pp[ni] = ch
+ni = ni + 1
+end
+else
+if ei < 3
+pp[8 + ei] = ch
+ei = ei + 1
+end
+end
+end
+ai = ai + 1
+end
+end
+end
+
+fn con_u64(v: u64)
+mut div: u64 = 10000000000000000000
+mut started: u64 = 0
+mut tmp: u64 = v
+while div > 0
+mut d: u64 = tmp / div
+if d != 0
+started = 1
+end
+if started == 1
+con_putc(d + 48)
+end
+tmp = tmp % div
+div = div / 10
+end
+if started == 0
+con_putc(48)
+end
+end
+
+fn shell_show(args: u64, has_args: u64)
+if has_args == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut disk: raw *u8 = rawptr(fs_disk())
+if fat_valid(disk) == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut pp: raw *u8 = rawptr(0x7BA0)
+fs_build_pattern(args, pp)
+mut idx: u64 = fat_find(disk, pp)
+if idx == 4294967295
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut buf: raw *u8 = rawptr(0x1500000)
+mut got: u64 = fat_read_file(disk, idx, buf, 65536)
+buf[got] = 0
+con_write(0x1500000)
+con_putc(10)
+end
+
+fn shell_where()
+con_putc(47)
+con_putc(10)
+end
+
+fn shell_space()
+mut disk: raw *u8 = rawptr(fs_disk())
+if fat_valid(disk) == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut total_c: u64 = fat_total_clusters(disk)
+mut free_c: u64 = fat_free_clusters(disk)
+mut cluster_bytes: u64 = fat_spc(disk) * fat_bps(disk)
+mut free_b: u64 = free_c * cluster_bytes
+mut total_b: u64 = total_c * cluster_bytes
+con_u64(free_b)
+con_putc(32)
+con_putc(47)
+con_putc(32)
+con_u64(total_b)
+con_putc(10)
+end
+
+fn shell_size(args: u64, has_args: u64)
+if has_args == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut disk: raw *u8 = rawptr(fs_disk())
+if fat_valid(disk) == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut pp: raw *u8 = rawptr(0x7BA0)
+fs_build_pattern(args, pp)
+mut idx: u64 = fat_find(disk, pp)
+if idx == 4294967295
+con_write(0x77CA)
+con_putc(10)
+return
+end
+con_u64(fat_entry_size(disk, idx))
+con_putc(10)
+end
+
+# Split args "src dst" at the first space: NUL-terminates src, returns
+# dst pointer (0 if no second arg). Args buffer is mutable (line buffer).
+fn fs_split_args(args: u64) -> u64
+mut ap: raw *u8 = rawptr(args)
+mut i: u64 = 0
+mut go: u64 = 1
+while go == 1
+mut ch: u8 = ap[i]
+if ch == 0
+go = 0
+else
+if ch == 32
+ap[i] = 0
+return args + i + 1
+else
+i = i + 1
+end
+end
+end
+return 0
+end
+
+fn shell_copy(args: u64, has_args: u64)
+if has_args == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut dst_args: u64 = fs_split_args(args)
+if dst_args == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut disk: raw *u8 = rawptr(fs_disk())
+if fat_valid(disk) == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut spp: raw *u8 = rawptr(0x7BA0)
+fs_build_pattern(args, spp)
+mut sidx: u64 = fat_find(disk, spp)
+if sidx == 4294967295
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut buf: raw *u8 = rawptr(0x1500000)
+mut got: u64 = fat_read_file(disk, sidx, buf, 65536)
+mut dpp: raw *u8 = rawptr(0x7BB0)
+fs_build_pattern(dst_args, dpp)
+mut same: u64 = 1
+mut ci: u64 = 0
+while ci < 11
+if spp[ci] != dpp[ci]
+same = 0
+end
+ci = ci + 1
+end
+if same == 1
+con_putc(10)
+return
+end
+mut didx: u64 = fat_find(disk, dpp)
+if didx != 4294967295
+fat_delete(disk, didx)
+end
+didx = fat_create(disk, dpp, 32)
+if didx == 4294967295
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut written: u64 = fat_write_file(disk, didx, buf, got)
+if written != got
+con_write(0x77CA)
+con_putc(10)
+return
+end
+con_putc(10)
+end
+
+fn shell_move(args: u64, has_args: u64)
+if has_args == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut dst_args: u64 = fs_split_args(args)
+if dst_args == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut disk: raw *u8 = rawptr(fs_disk())
+if fat_valid(disk) == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut spp: raw *u8 = rawptr(0x7BA0)
+fs_build_pattern(args, spp)
+mut sidx: u64 = fat_find(disk, spp)
+if sidx == 4294967295
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut buf: raw *u8 = rawptr(0x1500000)
+mut got: u64 = fat_read_file(disk, sidx, buf, 65536)
+mut dpp: raw *u8 = rawptr(0x7BB0)
+fs_build_pattern(dst_args, dpp)
+mut same: u64 = 1
+mut ci: u64 = 0
+while ci < 11
+if spp[ci] != dpp[ci]
+same = 0
+end
+ci = ci + 1
+end
+if same == 1
+con_putc(10)
+return
+end
+mut didx: u64 = fat_find(disk, dpp)
+if didx != 4294967295
+fat_delete(disk, didx)
+end
+didx = fat_create(disk, dpp, 32)
+if didx == 4294967295
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut written: u64 = fat_write_file(disk, didx, buf, got)
+if written != got
+con_write(0x77CA)
+con_putc(10)
+return
+end
+fat_delete(disk, sidx)
+con_putc(10)
+end
+
+fn shell_burn(args: u64, has_args: u64)
+if has_args == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut disk: raw *u8 = rawptr(fs_disk())
+if fat_valid(disk) == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut pp: raw *u8 = rawptr(0x7BA0)
+fs_build_pattern(args, pp)
+mut idx: u64 = fat_find(disk, pp)
+if idx == 4294967295
+con_write(0x77CA)
+con_putc(10)
+return
+end
+fat_delete(disk, idx)
+con_putc(10)
+end
+
+fn shell_newdir(args: u64, has_args: u64)
+if has_args == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut disk: raw *u8 = rawptr(fs_disk())
+if fat_valid(disk) == 0
+con_write(0x77CA)
+con_putc(10)
+return
+end
+mut pp: raw *u8 = rawptr(0x7BA0)
+fs_build_pattern(args, pp)
+mut idx: u64 = fat_find(disk, pp)
+if idx != 4294967295
+con_write(0x77CA)
+con_putc(10)
+return
+end
+idx = fat_create(disk, pp, 16)
+if idx == 4294967295
+con_write(0x77CA)
+con_putc(10)
+return
+end
+con_putc(10)
+end
+
 fn shell_exec(line: u64)
 mut sp: u64 = 0
 mut found: u64 = 0
@@ -640,28 +1056,28 @@ if str_eq(line, 0x78CB) == 1
 shell_notimpl(line)
 else
 if str_eq(line, 0x78CF) == 1
-shell_notimpl(line)
+shell_list()
 else
 if str_eq(line, 0x78D4) == 1
 shell_notimpl(line)
 else
 if str_eq(line, 0x78D8) == 1
-shell_notimpl(line)
+shell_where()
 else
 if str_eq(line, 0x78DE) == 1
-shell_notimpl(line)
+shell_copy(args, found)
 else
 if str_eq(line, 0x78E3) == 1
-shell_notimpl(line)
+shell_move(args, found)
 else
 if str_eq(line, 0x78E8) == 1
-shell_notimpl(line)
+shell_burn(args, found)
 else
 if str_eq(line, 0x78ED) == 1
-shell_notimpl(line)
+shell_newdir(args, found)
 else
 if str_eq(line, 0x78F4) == 1
-shell_notimpl(line)
+shell_show(args, found)
 else
 if str_eq(line, 0x78F9) == 1
 shell_notimpl(line)
@@ -682,10 +1098,10 @@ if str_eq(line, 0x7916) == 1
 shell_notimpl(line)
 else
 if str_eq(line, 0x791B) == 1
-shell_notimpl(line)
+shell_space()
 else
 if str_eq(line, 0x7921) == 1
-shell_notimpl(line)
+shell_size(args, found)
 else
 if str_eq(line, 0x7926) == 1
 shell_notimpl(line)
@@ -971,6 +1387,17 @@ end
 return 0
 end
 
+fn xh_wait_set(addr: u64, mask: u32) -> int
+mut to: u64 = 5000000
+while to > 0
+if (peek32(addr) & mask) == mask
+return 1
+end
+to = to - 1
+end
+return 0
+end
+
 # ---------------- xHCI init ----------------
 fn xhci_init() -> int
 mut mmio: u64 = xhci_find()
@@ -988,20 +1415,28 @@ xh_stw(32, op)
 xh_stw(16, peek32(mmio + 20))
 xh_stw(24, peek32(mmio + 24))
 if (peek32(mmio + 16) & 4) == 4
+serial_putc(65)
 return 0
 end
 mut cmd: u32 = peek32(op)
+shex(cmd)
+serial_putc(32)
+shex(peek32(op + 4))
+serial_putc(10)
 if (cmd & 1) == 1
 poke32(op, cmd & 0xFFFFFFFE)
-if xh_wait_clr(op + 4, 1) == 0
+if xh_wait_set(op + 4, 1) == 0
+serial_putc(66)
 return 0
 end
 end
 poke32(op, peek32(op) | 2)
 if xh_wait_clr(op, 2) == 0
+serial_putc(67)
 return 0
 end
 if xh_wait_clr(op + 4, 2048) == 0
+serial_putc(68)
 return 0
 end
 mut slots: u32 = peek32(mmio + 4) & 255
@@ -1175,8 +1610,8 @@ return r & 255
 end
 
 fn xh_epctx(base: u64, mps: u64, etype: u64, ring: u64, cyc: u64, interval: u64)
-poke32(base, interval << 16)
-poke32(base + 4, (6 | (etype << 3)) | (mps << 16))
+poke32(base, (interval << 16) | etype)
+poke32(base + 4, 6 | (mps << 16))
 poke64(base + 8, ring | cyc)
 poke32(base + 12, 0)
 poke32(base + 16, 8)
@@ -1257,7 +1692,7 @@ end
 fn xh_control(slot: u64, s0: u64, s1: u64, data: u64, ln: u64) -> int
 mut trt: u64 = s1 & 255
 mut ddir: u64 = (s1 >> 8) & 255
-xh_ep0_trb(s0, 8, (2 << 10) | (1 << 4) | (trt << 16))
+xh_ep0_trb(s0, 8, (2 << 10) | (1 << 6) | (trt << 16))
 if ln > 0
 xh_ep0_trb(data, ln, (3 << 10) | (ddir << 16))
 end
@@ -1277,7 +1712,7 @@ end
 
 fn xh_get_desc(slot: u64, val: u64, ln: u64) -> int
 mut s0: u64 = 128 | (6 << 8) | (val << 16) | (ln << 48)
-return xh_control(slot, s0, 2 | (1 << 8), 0x1100780, ln)
+return xh_control(slot, s0, 3 | (1 << 8), 0x1100780, ln)
 end
 
 fn xh_set_config(slot: u64, cfg: u64) -> int
@@ -1293,7 +1728,7 @@ end
 fn xh_config_ep(slot: u64, dci: u64, interval: u64) -> int
 mut dd: u32 = dci
 poke32(0x1100040, 0)
-poke32(0x1100044, 3 | (1 << dd))
+poke32(0x1100044, 1 | (1 << dd))
 xh_slotctx(dci)
 xh_epctx(0x1100080, xh_st(144), 4, 0x1100580 + xh_st(56) * 16, xh_st(64), 0)
 xh_epctx(0x1100080 + (dci - 1) * 32, 8, 7, 0x1100680, 1, interval)

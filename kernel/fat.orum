@@ -1,0 +1,408 @@
+# fat.orum — FAT16 reader for Menagerie kernel.
+#
+# Pure logic over a disk image in memory. No syscalls, no console I/O,
+# no heap — so it works identically hosted (test) and freestanding
+# (kernel). The disk image is a RAM disk: `disk` is the address of
+# sector 0. The caller (hosted test or kernel shell) does all printing.
+#
+# FAT16 layout (all values from the BPB in sector 0):
+#   +11 u16 bytes per sector | +13 u8 sectors per cluster
+#   +14 u16 reserved sectors | +16 u8 number of FATs
+#   +17 u16 root entries | +22 u16 FAT size in sectors
+#   root dir = reserved + nfats*fatsize (in sectors)
+#   data area = root dir + ceil(root_entries*32 / bps) (in sectors)
+#   cluster N data sector = data + (N-2)*spc
+#   FAT entry N = u16 at fat_start + N*2 (0xFFF8+ = end of chain)
+# Directory entry (32 bytes):
+#   +0 name 8 | +8 ext 3 | +11 attr | +26 first cluster u16 | +28 size u32
+#   attr 0x10 = dir, 0x20 = file, 0x0F = LFN (skip), 0x08 = volume (skip)
+#   first byte 0x00 = end of directory, 0xE5 = deleted (skip)
+
+fn fat_rd16(disk: raw *u8, off: u64) -> u64
+mut p: raw *u8 = disk + off
+mut lo: u64 = p[0]
+mut hi: u64 = p[1]
+return lo + hi * 256
+end
+
+fn fat_rd32(disk: raw *u8, off: u64) -> u64
+mut p: raw *u8 = disk + off
+mut b0: u64 = p[0]
+mut b1: u64 = p[1]
+mut b2: u64 = p[2]
+mut b3: u64 = p[3]
+return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+end
+
+fn fat_bps(disk: raw *u8) -> u64
+return fat_rd16(disk, 11)
+end
+
+fn fat_spc(disk: raw *u8) -> u64
+mut p: raw *u8 = disk + 13
+return p[0]
+end
+
+fn fat_reserved(disk: raw *u8) -> u64
+return fat_rd16(disk, 14)
+end
+
+fn fat_nfats(disk: raw *u8) -> u64
+mut p: raw *u8 = disk + 16
+return p[0]
+end
+
+fn fat_root_entries(disk: raw *u8) -> u64
+return fat_rd16(disk, 17)
+end
+
+fn fat_size(disk: raw *u8) -> u64
+return fat_rd16(disk, 22)
+end
+
+fn fat_root_sector(disk: raw *u8) -> u64
+return fat_reserved(disk) + fat_nfats(disk) * fat_size(disk)
+end
+
+fn fat_data_sector(disk: raw *u8) -> u64
+mut root_bytes: u64 = fat_root_entries(disk) * 32
+mut bps: u64 = fat_bps(disk)
+mut root_sectors: u64 = (root_bytes + bps - 1) / bps
+return fat_root_sector(disk) + root_sectors
+end
+
+fn fat_cluster_sector(disk: raw *u8, cluster: u64) -> u64
+return fat_data_sector(disk) + (cluster - 2) * fat_spc(disk)
+end
+
+fn fat_total_sectors(disk: raw *u8) -> u64
+mut t16: u64 = fat_rd16(disk, 19)
+if t16 != 0
+return t16
+end
+return fat_rd32(disk, 32)
+end
+
+fn fat_total_clusters(disk: raw *u8) -> u64
+mut total: u64 = fat_total_sectors(disk)
+mut data: u64 = fat_data_sector(disk)
+return (total - data) / fat_spc(disk)
+end
+
+fn fat_free_clusters(disk: raw *u8) -> u64
+mut total: u64 = fat_total_clusters(disk)
+mut free: u64 = 0
+mut c: u64 = 2
+while c < total + 2
+if fat_next_cluster(disk, c) == 0
+free = free + 1
+end
+c = c + 1
+end
+return free
+end
+
+fn fat_valid(disk: raw *u8) -> u64
+mut p: raw *u8 = disk + 510
+if p[0] == 85
+if p[1] == 170
+return 1
+end
+end
+return 0
+end
+
+fn fat_next_cluster(disk: raw *u8, cluster: u64) -> u64
+mut bps: u64 = fat_bps(disk)
+mut fat_byte: u64 = fat_reserved(disk) * bps + cluster * 2
+return fat_rd16(disk, fat_byte)
+end
+
+fn fat_entry_off(disk: raw *u8, idx: u64) -> u64
+mut bps: u64 = fat_bps(disk)
+return fat_root_sector(disk) * bps + idx * 32
+end
+
+fn fat_entry_first_byte(disk: raw *u8, idx: u64) -> u64
+mut p: raw *u8 = disk + fat_entry_off(disk, idx)
+return p[0]
+end
+
+fn fat_entry_attr(disk: raw *u8, idx: u64) -> u64
+mut p: raw *u8 = disk + fat_entry_off(disk, idx) + 11
+return p[0]
+end
+
+fn fat_entry_cluster(disk: raw *u8, idx: u64) -> u64
+return fat_rd16(disk, fat_entry_off(disk, idx) + 26)
+end
+
+fn fat_entry_size(disk: raw *u8, idx: u64) -> u64
+return fat_rd32(disk, fat_entry_off(disk, idx) + 28)
+end
+
+# 1 if entry idx is a real file or dir (not empty, deleted, LFN, volume).
+fn fat_entry_valid(disk: raw *u8, idx: u64) -> u64
+mut b0: u64 = fat_entry_first_byte(disk, idx)
+if b0 == 0
+return 0
+end
+if b0 == 229
+return 0
+end
+mut attr: u64 = fat_entry_attr(disk, idx)
+if attr == 15
+return 0
+end
+if attr == 8
+return 0
+end
+return 1
+end
+
+# Compare an 11-byte (8+3) name at entry idx with an 11-byte pattern.
+# Returns 1 on match. Pattern is space-padded, e.g. "HELLO   TXT".
+fn fat_entry_name_eq(disk: raw *u8, idx: u64, pat: raw *u8) -> u64
+mut off: u64 = fat_entry_off(disk, idx)
+mut pp: raw *u8 = pat
+mut ep: raw *u8 = disk + off
+mut i: u64 = 0
+while i < 11
+if pp[i] != ep[i]
+return 0
+end
+i = i + 1
+end
+return 1
+end
+
+# Find entry index by 11-byte name. Returns index, or 0xFFFFFFFF if absent.
+fn fat_find(disk: raw *u8, pat: raw *u8) -> u64
+mut n: u64 = fat_root_entries(disk)
+mut i: u64 = 0
+while i < n
+if fat_entry_first_byte(disk, i) == 0
+return 4294967295
+end
+if fat_entry_valid(disk, i) == 1
+if fat_entry_name_eq(disk, i, pat) == 1
+return i
+end
+end
+i = i + 1
+end
+return 4294967295
+end
+
+# Read file at entry idx into buf (max bytes). Follows the cluster chain.
+# Returns bytes actually read.
+fn fat_read_file(disk: raw *u8, idx: u64, buf: raw *u8, max: u64) -> u64
+mut cluster: u64 = fat_entry_cluster(disk, idx)
+mut remaining: u64 = fat_entry_size(disk, idx)
+mut out_pos: u64 = 0
+mut bps: u64 = fat_bps(disk)
+mut spc: u64 = fat_spc(disk)
+mut cluster_bytes: u64 = spc * bps
+while cluster < 4088
+if remaining == 0
+return out_pos
+end
+if out_pos >= max
+return out_pos
+end
+mut sector: u64 = fat_cluster_sector(disk, cluster)
+mut src: raw *u8 = disk + sector * bps
+mut to_copy: u64 = remaining
+if to_copy > cluster_bytes
+to_copy = cluster_bytes
+end
+if out_pos + to_copy > max
+to_copy = max - out_pos
+end
+mut sp: raw *u8 = src
+mut dp: raw *u8 = buf + out_pos
+mut i: u64 = 0
+while i < to_copy
+dp[i] = sp[i]
+i = i + 1
+end
+out_pos = out_pos + to_copy
+remaining = remaining - to_copy
+cluster = fat_next_cluster(disk, cluster)
+end
+return out_pos
+end
+
+# ---------------- FAT write support (v0.5) ----------------
+# The disk is a RAM disk (memory), so writes are just stores into the
+# image. Same pointer arithmetic as reads.
+
+fn fat_wr16(disk: raw *u8, off: u64, val: u64)
+mut p: raw *u8 = disk + off
+p[0] = val & 255
+p[1] = (val / 256) & 255
+end
+
+fn fat_wr32(disk: raw *u8, off: u64, val: u64)
+mut p: raw *u8 = disk + off
+p[0] = val & 255
+p[1] = (val / 256) & 255
+p[2] = (val / 65536) & 255
+p[3] = (val / 16777216) & 255
+end
+
+fn fat_set_fat(disk: raw *u8, cluster: u64, val: u64)
+mut bps: u64 = fat_bps(disk)
+mut fat_byte: u64 = fat_reserved(disk) * bps + cluster * 2
+fat_wr16(disk, fat_byte, val)
+end
+
+# Allocate one free cluster, mark it end-of-chain. Returns cluster, or 0.
+fn fat_alloc(disk: raw *u8) -> u64
+mut total: u64 = fat_total_clusters(disk)
+mut c: u64 = 2
+while c < total + 2
+if fat_next_cluster(disk, c) == 0
+fat_set_fat(disk, c, 65535)
+return c
+end
+c = c + 1
+end
+return 0
+end
+
+# Free a whole cluster chain starting at cluster (0 = nothing to free).
+fn fat_free_chain(disk: raw *u8, cluster: u64)
+mut c: u64 = cluster
+while c >= 2
+if c >= 4088
+return
+end
+mut nxt: u64 = fat_next_cluster(disk, c)
+fat_set_fat(disk, c, 0)
+c = nxt
+end
+end
+
+# Find a free directory slot (0x00 end-marker or 0xE5 deleted).
+# Returns index, or 0xFFFFFFFF if the root directory is full.
+fn fat_find_free_entry(disk: raw *u8) -> u64
+mut n: u64 = fat_root_entries(disk)
+mut i: u64 = 0
+while i < n
+mut b0: u64 = fat_entry_first_byte(disk, i)
+if b0 == 0
+return i
+end
+if b0 == 229
+return i
+end
+i = i + 1
+end
+return 4294967295
+end
+
+# Write a 32-byte directory entry at idx from an 11-byte pattern.
+fn fat_write_entry(disk: raw *u8, idx: u64, pat: raw *u8, attr: u64, cluster: u64, size: u64)
+mut off: u64 = fat_entry_off(disk, idx)
+mut ep: raw *u8 = disk + off
+mut i: u64 = 0
+while i < 11
+ep[i] = pat[i]
+i = i + 1
+end
+ep[11] = attr
+mut j: u64 = 12
+while j < 26
+ep[j] = 0
+j = j + 1
+end
+fat_wr16(disk, off + 26, cluster)
+fat_wr32(disk, off + 28, size)
+end
+
+# Create a new entry. For dirs, allocates and zeroes one cluster.
+# Returns index, or 0xFFFFFFFF on failure (dir full or disk full).
+fn fat_create(disk: raw *u8, pat: raw *u8, attr: u64) -> u64
+mut idx: u64 = fat_find_free_entry(disk)
+if idx == 4294967295
+return 4294967295
+end
+mut cluster: u64 = 0
+if attr == 16
+cluster = fat_alloc(disk)
+if cluster == 0
+return 4294967295
+end
+mut bps: u64 = fat_bps(disk)
+mut sector: u64 = fat_cluster_sector(disk, cluster)
+mut dp: raw *u8 = disk + sector * bps
+mut i: u64 = 0
+while i < bps
+dp[i] = 0
+i = i + 1
+end
+end
+fat_write_entry(disk, idx, pat, attr, cluster, 0)
+return idx
+end
+
+# Delete entry idx: mark deleted, free its cluster chain.
+fn fat_delete(disk: raw *u8, idx: u64)
+mut cluster: u64 = fat_entry_cluster(disk, idx)
+fat_free_chain(disk, cluster)
+mut ep: raw *u8 = disk + fat_entry_off(disk, idx)
+ep[0] = 229
+end
+
+# Overwrite file at idx with buf[0..len]. Frees the old chain, allocates
+# fresh clusters, updates size. Returns bytes written (len on success).
+fn fat_write_file(disk: raw *u8, idx: u64, buf: raw *u8, len: u64) -> u64
+mut old_cluster: u64 = fat_entry_cluster(disk, idx)
+fat_free_chain(disk, old_cluster)
+mut bps: u64 = fat_bps(disk)
+mut spc: u64 = fat_spc(disk)
+mut cluster_bytes: u64 = spc * bps
+mut written: u64 = 0
+mut prev: u64 = 0
+mut first: u64 = 0
+while written < len
+mut c: u64 = fat_alloc(disk)
+if c == 0
+if first != 0
+fat_free_chain(disk, first)
+end
+mut fail_off: u64 = fat_entry_off(disk, idx)
+fat_wr16(disk, fail_off + 26, 0)
+fat_wr32(disk, fail_off + 28, 0)
+return written
+end
+if first == 0
+first = c
+end
+if prev != 0
+fat_set_fat(disk, prev, c)
+end
+mut sector: u64 = fat_cluster_sector(disk, c)
+mut dp: raw *u8 = disk + sector * bps
+mut to_copy: u64 = len - written
+if to_copy > cluster_bytes
+to_copy = cluster_bytes
+end
+mut sp: raw *u8 = buf + written
+mut i: u64 = 0
+while i < to_copy
+dp[i] = sp[i]
+i = i + 1
+end
+written = written + to_copy
+prev = c
+end
+if prev != 0
+fat_set_fat(disk, prev, 65535)
+end
+mut off: u64 = fat_entry_off(disk, idx)
+fat_wr16(disk, off + 26, first)
+fat_wr32(disk, off + 28, len)
+return written
+end
