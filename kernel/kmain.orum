@@ -4,7 +4,7 @@
 # Filesystem (v0.5): FAT16 reader (kernel/fat.orum) over a RAM disk.
 #   RAM disk at 0x3000000 (1MB, placed there by the bootloader/test harness).
 #   FAT name buffer at 0x7B90 (16B) | file scratch at 0x1500000 (64KB).
-take fat_valid, fat_root_entries, fat_entry_valid, fat_entry_first_byte, fat_entry_attr, fat_entry_cluster, fat_entry_size, fat_entry_name_eq, fat_find, fat_read_file, fat_entry_off, fat_total_sectors, fat_total_clusters, fat_free_clusters, fat_bps, fat_spc, fat_create, fat_delete, fat_write_file from fat
+take fat_valid, fat_root_entries, fat_entry_valid, fat_entry_first_byte, fat_entry_attr, fat_entry_cluster, fat_entry_size, fat_entry_name_eq, fat_find, fat_read_file, fat_read_at, fat_append, fat_entry_off, fat_total_sectors, fat_total_clusters, fat_free_clusters, fat_bps, fat_spc, fat_create, fat_delete, fat_write_file from fat
 #
 # Low memory (see docs/boot-contract.md):
 #   0x5000 IDT (4K, kernel builds it) | 0x6000 ISR stubs (256 x 16B)
@@ -194,12 +194,23 @@ row = row + 1
 end
 end
 
+# Console geometry from the boot-info block (0x9000): width/8 cols,
+# height/16 rows. No more hardcoded 128x48 (1024x768 assumption).
+fn con_cols() -> u32
+return peek32(0x901C) / 8
+end
+
+fn con_rows() -> u32
+return peek32(0x9020) / 16
+end
+
 fn con_scroll()
 mut fba: u64 = peek64(0x74E0)
 mut stride: u64 = peek32(0x74E8)
 mut dst: raw *u64 = rawptr(fba)
 mut src: raw *u64 = rawptr(fba + stride * 64)
-mut n: u64 = 47 * 16 * stride / 2
+mut rows: u32 = con_rows()
+mut n: u64 = (rows - 1) * 16 * stride / 2
 mut i: u64 = 0
 while i < n
 dst[i] = src[i]
@@ -207,10 +218,11 @@ i = i + 1
 end
 mut fb: raw *u32 = rawptr(fba)
 mut st32: u32 = peek32(0x74E8)
-mut y: u32 = 47 * 16
-while y < 48 * 16
+mut y: u32 = (rows - 1) * 16
+while y < rows * 16
 mut x: u32 = 0
-while x < 128 * 8
+mut cols: u32 = con_cols()
+while x < cols * 8
 fb[y * st32 + x] = 4128
 x = x + 1
 end
@@ -222,9 +234,10 @@ fn con_newline()
 mut cy: u64 = peek64(0x751C)
 poke64(0x7514, 0)
 cy = cy + 1
-if cy >= 48
+mut rows: u32 = con_rows()
+if cy >= rows
 con_scroll()
-cy = 47
+cy = rows - 1
 end
 poke64(0x751C, cy)
 end
@@ -242,13 +255,15 @@ mut x32: u32 = cx
 mut y32: u32 = cy
 draw_glyph_at(ch, x32, y32, 16777215)
 cx = cx + 1
-if cx >= 128
+mut cols: u32 = con_cols()
+if cx >= cols
 cx = 0
 cy = cy + 1
 end
-if cy >= 48
+mut rows: u32 = con_rows()
+if cy >= rows
 con_scroll()
-cy = 47
+cy = rows - 1
 end
 poke64(0x7514, cx)
 poke64(0x751C, cy)
@@ -274,7 +289,7 @@ fn con_clear()
 mut fba: u64 = peek64(0x74E0)
 mut stride: u64 = peek32(0x74E8)
 mut fb: raw *u32 = rawptr(fba)
-mut n: u64 = stride * 768
+mut n: u64 = stride * con_rows() * 16
 mut i: u64 = 0
 while i < n
 mut i32: u32 = i
@@ -872,8 +887,6 @@ con_write(0x77CA)
 con_putc(10)
 return
 end
-mut buf: raw *u8 = rawptr(0x1500000)
-mut got: u64 = fat_read_file(disk, sidx, buf, 65536)
 mut dpp: raw *u8 = rawptr(0x7BB0)
 fs_build_pattern(dst_args, dpp)
 mut same: u64 = 1
@@ -898,8 +911,30 @@ con_write(0x77CA)
 con_putc(10)
 return
 end
-mut written: u64 = fat_write_file(disk, didx, buf, got)
-if written != got
+mut buf: raw *u8 = rawptr(0x1500000)
+mut total: u64 = fat_entry_size(disk, sidx)
+mut off: u64 = 0
+mut ok: u64 = 1
+while off < total
+mut chunk: u64 = total - off
+if chunk > 65536
+chunk = 65536
+end
+mut got: u64 = fat_read_at(disk, sidx, off, buf, chunk)
+if got == 0
+ok = 0
+off = total
+else
+mut put: u64 = fat_append(disk, didx, buf, got)
+if put != got
+ok = 0
+off = total
+else
+off = off + got
+end
+end
+end
+if ok == 0
 con_write(0x77CA)
 con_putc(10)
 return
@@ -933,8 +968,6 @@ con_write(0x77CA)
 con_putc(10)
 return
 end
-mut buf: raw *u8 = rawptr(0x1500000)
-mut got: u64 = fat_read_file(disk, sidx, buf, 65536)
 mut dpp: raw *u8 = rawptr(0x7BB0)
 fs_build_pattern(dst_args, dpp)
 mut same: u64 = 1
@@ -959,8 +992,30 @@ con_write(0x77CA)
 con_putc(10)
 return
 end
-mut written: u64 = fat_write_file(disk, didx, buf, got)
-if written != got
+mut buf: raw *u8 = rawptr(0x1500000)
+mut total: u64 = fat_entry_size(disk, sidx)
+mut off: u64 = 0
+mut ok: u64 = 1
+while off < total
+mut chunk: u64 = total - off
+if chunk > 65536
+chunk = 65536
+end
+mut got: u64 = fat_read_at(disk, sidx, off, buf, chunk)
+if got == 0
+ok = 0
+off = total
+else
+mut put: u64 = fat_append(disk, didx, buf, got)
+if put != got
+ok = 0
+off = total
+else
+off = off + got
+end
+end
+end
+if ok == 0
 con_write(0x77CA)
 con_putc(10)
 return

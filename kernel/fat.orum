@@ -203,7 +203,7 @@ mut out_pos: u64 = 0
 mut bps: u64 = fat_bps(disk)
 mut spc: u64 = fat_spc(disk)
 mut cluster_bytes: u64 = spc * bps
-while cluster < 4088
+while cluster < 65528
 if remaining == 0
 return out_pos
 end
@@ -275,7 +275,7 @@ end
 fn fat_free_chain(disk: raw *u8, cluster: u64)
 mut c: u64 = cluster
 while c >= 2
-if c >= 4088
+if c >= 65528
 return
 end
 mut nxt: u64 = fat_next_cluster(disk, c)
@@ -404,5 +404,125 @@ end
 mut off: u64 = fat_entry_off(disk, idx)
 fat_wr16(disk, off + 26, first)
 fat_wr32(disk, off + 28, len)
+return written
+end
+
+# Read len bytes from file idx starting at file_off into buf.
+# Returns bytes actually read (clamped to file size, 0 if off past end).
+fn fat_read_at(disk: raw *u8, idx: u64, file_off: u64, buf: raw *u8, len: u64) -> u64
+mut fsize: u64 = fat_entry_size(disk, idx)
+if file_off >= fsize
+return 0
+end
+mut bps: u64 = fat_bps(disk)
+mut spc: u64 = fat_spc(disk)
+mut cluster_bytes: u64 = spc * bps
+mut cluster: u64 = fat_entry_cluster(disk, idx)
+mut skip: u64 = file_off / cluster_bytes
+mut ci: u64 = 0
+while ci < skip
+cluster = fat_next_cluster(disk, cluster)
+if cluster >= 65528
+return 0
+end
+ci = ci + 1
+end
+mut pos_in: u64 = file_off - skip * cluster_bytes
+mut remaining: u64 = len
+if remaining > fsize - file_off
+remaining = fsize - file_off
+end
+mut out_pos: u64 = 0
+while remaining > 0
+if cluster >= 65528
+return out_pos
+end
+mut sector: u64 = fat_cluster_sector(disk, cluster)
+mut src: raw *u8 = disk + sector * bps + pos_in
+mut avail: u64 = cluster_bytes - pos_in
+mut to_copy: u64 = remaining
+if to_copy > avail
+to_copy = avail
+end
+mut i: u64 = 0
+while i < to_copy
+buf[out_pos + i] = src[i]
+i = i + 1
+end
+out_pos = out_pos + to_copy
+remaining = remaining - to_copy
+pos_in = 0
+if remaining > 0
+cluster = fat_next_cluster(disk, cluster)
+end
+end
+return out_pos
+end
+
+# Append len bytes from buf to the end of file idx. Extends the chain
+# as needed. Returns bytes actually appended; updates the size field.
+fn fat_append(disk: raw *u8, idx: u64, buf: raw *u8, len: u64) -> u64
+mut bps: u64 = fat_bps(disk)
+mut spc: u64 = fat_spc(disk)
+mut cluster_bytes: u64 = spc * bps
+mut size: u64 = fat_entry_size(disk, idx)
+mut last: u64 = 0
+mut c: u64 = fat_entry_cluster(disk, idx)
+while c >= 2
+if c >= 65528
+c = 0
+end
+if c != 0
+last = c
+c = fat_next_cluster(disk, c)
+end
+end
+mut cur: u64 = last
+mut off_in: u64 = 0
+if size > 0
+off_in = size - (size / cluster_bytes) * cluster_bytes
+if off_in == 0
+cur = 0
+end
+end
+mut written: u64 = 0
+while written < len
+if cur == 0
+mut nc: u64 = fat_alloc(disk)
+if nc == 0
+mut off2: u64 = fat_entry_off(disk, idx)
+fat_wr32(disk, off2 + 28, size + written)
+return written
+end
+if last != 0
+fat_set_fat(disk, last, nc)
+else
+mut off3: u64 = fat_entry_off(disk, idx)
+fat_wr16(disk, off3 + 26, nc)
+end
+last = nc
+cur = nc
+off_in = 0
+end
+mut sector: u64 = fat_cluster_sector(disk, cur)
+mut dp: raw *u8 = disk + sector * bps + off_in
+mut avail: u64 = cluster_bytes - off_in
+mut to_copy: u64 = len - written
+if to_copy > avail
+to_copy = avail
+end
+mut i: u64 = 0
+while i < to_copy
+dp[i] = buf[written + i]
+i = i + 1
+end
+written = written + to_copy
+off_in = off_in + to_copy
+if off_in >= cluster_bytes
+cur = 0
+end
+end
+mut off4: u64 = fat_entry_off(disk, idx)
+fat_wr32(disk, off4 + 28, size + written)
 return written
 end
